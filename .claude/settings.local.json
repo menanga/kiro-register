@@ -1,0 +1,88 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_ecc_exa__web_search_exa",
+      "mcp__plugin_ecc_exa__web_fetch_exa",
+      "mcp__plugin_ecc_github__get_file_contents",
+      "mcp__plugin_ecc_github__search_code",
+      "Bash(sqlite3 *)",
+      "Bash(python3 *)"
+    ],
+    "allowed": [
+      "python *",
+      "python3 *",
+      "pip install -r requirements.txt",
+      "pip install -e .",
+      "pip list",
+      "pip show *",
+      "pytest *",
+      "python -m pytest *",
+      "ruff *",
+      "black *",
+      "mypy *",
+      "flake8 *",
+      "playwright *",
+      "python -m playwright *"
+    ],
+    "denied": [
+      "pip install --user *",
+      "pip uninstall *"
+    ]
+  },
+  "project": {
+    "name": "kiro-register",
+    "description": "AWS Builder ID automation toolkit",
+    "languages": [
+      "python"
+    ],
+    "frameworks": [
+      "playwright",
+      "tkinter"
+    ]
+  },
+  "commands": {
+    "test": "pytest",
+    "test:verbose": "python -m pytest -v",
+    "test:coverage": "pytest --cov=. --cov-report=html",
+    "lint": "ruff check .",
+    "lint:fix": "ruff check --fix .",
+    "format": "ruff format .",
+    "typecheck": "mypy .",
+    "run": "python main.py",
+    "build": "python build.py",
+    "install": "pip install -r requirements.txt",
+    "playwright:install": "python -m playwright install chromium"
+  },
+  "ecc": {
+    "enabled": true,
+    "rules": [
+      "common",
+      "python"
+    ],
+    "skills": [
+      "python-patterns",
+      "python-testing",
+      "tdd-workflow",
+      "verification-loop"
+    ]
+  },
+  "verification": {
+    "afterEdit": true,
+    "commands": {
+      "lint": "ruff check .",
+      "typecheck": "mypy . || true"
+    }
+  },
+  "paths": {
+    "source": [
+      "*.py",
+      "mail_providers/**/*.py"
+    ],
+    "tests": [
+      "tests/**/*.py"
+    ],
+    "config": [
+      "kiro_config.json"
+    ]
+  }
+}

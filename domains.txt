@@ -2,30 +2,39 @@
 # One domain per line. Lines starting with # are ignored.
 # Each domain must have its MX configured to forward all aliases (catch-all)
 # to a single Gmail/Workspace inbox that gsuite_imap will poll via IMAP.
-aetherstack.tech
-byteharbor.tech
-cipherbloom.tech
-cloudanvil.tech
-drivoraq.tech
-korvexa.tech
-luminqor.tech
-metricmint.tech
-neurofoundry.tech
-nextravo.tech
-novakernel.tech
-noventiq.tech
-novytrix.tech
-pryzora.tech
-pulseharbor.tech
-qorvani.tech
-quorvex.tech
-signalsmith.tech
-stackpulse.tech
-syntravo.tech
-trynovaq.tech
-velqonic.tech
-veltrixa.tech
-xelvanta.tech
-xynvora.tech
-zynqora.tech
-zyvanta.tech
+# aetherstack.tech
+# byteharbor.tech
+# cipherbloom.tech
+# cloudanvil.tech
+# drivoraq.tech
+# korvexa.tech
+# luminqor.tech
+# metricmint.tech
+# neurofoundry.tech
+# nextravo.tech
+# novakernel.tech
+# noventiq.tech
+# novytrix.tech
+# pryzora.tech
+# pulseharbor.tech
+# qorvani.tech
+# quorvex.tech
+# signalsmith.tech
+# stackpulse.tech
+# syntravo.tech
+# trynovaq.tech
+# velqonic.tech
+# veltrixa.tech
+# xelvanta.tech
+# xynvora.tech
+# zynqora.tech
+# zyvanta.tech
+
+
+#dibarisin.com
+forumbaris.com
+menangatechnology.my.id
+fastev.my.id
+hamanstore.biz.id
+
+

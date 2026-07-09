@@ -1486,3 +1486,677 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
         "refreshToken": refresh_token,
         "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).strftime("%Y/%m/%d %H:%M:%S"),
     }
+
+
+# ============================================================================
+# 9router OAuth Device Code Flow Registration
+# ============================================================================
+
+async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboard=True,
+                                     mail_provider_instance=None,
+                                     router9_config=None,
+                                     proxy_url=None,
+                                     log=print, cancel_check=None):
+    """
+    Register AWS Builder ID via 9router OAuth device code flow.
+
+    Automatically exports account to 9router during registration instead of
+    requiring a separate export step afterward.
+
+    Args:
+        headless: run browser headlessly
+        auto_login: inject local tokens after registration
+        skip_onboard: skip onboarding flow
+        mail_provider_instance: MailProvider instance
+        router9_config: dict with {base_url, password, auth_token, auth_token_expires_at}
+        proxy_url: optional HTTP/SOCKS proxy
+        log: logging callback
+        cancel_check: callable returning True to abort
+
+    Returns:
+        dict with account info + router9_exported flag, or None
+    """
+    from curl_cffi import requests as curl_requests
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
+    from router9_oauth import Router9OAuthClient
+
+    if cancel_check and cancel_check():
+        return None
+
+    if not router9_config:
+        log("router9_config required for OAuth flow", "error")
+        return None
+
+    # Setup
+    fp_config = _random_fingerprint_config()
+    log(f"Fingerprint: Chrome/{fp_config['user_agent'].split('Chrome/')[1].split(' ')[0]}, "
+        f"{fp_config['viewport']['width']}x{fp_config['viewport']['height']}", "dbg")
+
+    pw_proxy = _parse_proxy_url(proxy_url)
+    if pw_proxy:
+        log(f"Proxy: {pw_proxy['server']}", "ok")
+
+    if not mail_provider_instance:
+        log("mail_provider_instance required", "error")
+        return None
+
+    mail = mail_provider_instance
+    email = mail.create_mailbox()
+    password = _generate_password()
+    full_name = _generate_name()
+    log(f"Email: {email}", "ok")
+
+    def _partial(reason="unknown"):
+        return {
+            "email": email, "password": password, "full_name": full_name,
+            "provider": "BuilderId", "authMethod": "IdC", "region": "us-east-1",
+            "accessToken": "", "refreshToken": "", "incomplete": True,
+            "failReason": reason, "router9_exported": False,
+        }
+
+    # Phase 1: 9router device code
+    log("Phase 1: 9router OAuth device code")
+    r9 = Router9OAuthClient(router9_config["base_url"], router9_config["password"])
+
+    ok, token, expires = r9.ensure_auth_token(
+        router9_config.get("auth_token"),
+        router9_config.get("auth_token_expires_at"),
+        log
+    )
+    if not ok:
+        return _partial("9router auth failed")
+
+    router9_config["auth_token"] = token
+    router9_config["auth_token_expires_at"] = expires
+    r9.auth_token = token  # Ensure instance variable is set for poll_account()
+
+    dev = r9.get_device_code(log)
+    if not dev["ok"]:
+        return _partial("device code failed")
+
+    device_code = dev["device_code"]
+    verify_url = dev["verification_uri_complete"]
+    client_id = dev["_clientId"]
+    client_secret = dev["_clientSecret"]
+    code_verifier = dev["codeVerifier"]
+    region = dev.get("_region", "us-east-1")
+
+    log(f"User code: {dev.get('user_code', 'N/A')}", "ok")
+    log(f"URL: {verify_url[:60]}...", "info")
+
+    # Phase 2: Browser automation
+    log(f"Phase 2: browser (headless={headless})")
+
+    async with async_playwright() as p:
+        args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ]
+        if headless:
+            args += ["--disable-gpu", "--no-sandbox"]
+
+        kwargs = {"headless": headless, "args": args}
+        if pw_proxy:
+            kwargs["proxy"] = pw_proxy
+
+        browser = await p.chromium.launch(**kwargs)
+        ctx = await browser.new_context(
+            viewport=fp_config["viewport"],
+            screen=fp_config["screen"],
+            locale=fp_config["locale"],
+            timezone_id=fp_config["timezone"],
+            user_agent=fp_config["user_agent"],
+            device_scale_factor=fp_config["pixel_ratio"],
+        )
+        page = await ctx.new_page()
+        await Stealth().apply_stealth_async(page)
+        await ctx.add_init_script(_build_fingerprint_script(fp_config))
+
+        try:
+            await page.goto(verify_url, timeout=60000)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            except:
+                pass
+            await asyncio.sleep(3)
+            await _dismiss_cookie(page)
+
+            # Wait for automatic redirect to signin page (if no session exists)
+            log("Waiting for signup/signin page...", "info")
+            for _ in range(15):
+                current_url = page.url
+                log(f"Current URL: {current_url}", "dbg")
+                if "signin.aws" in current_url or "profile.aws" in current_url:
+                    break
+                await asyncio.sleep(2)
+
+            log("At registration page", "ok")
+
+            # Fill email if on signin page
+            if "signin.aws" in page.url:
+                log("Looking for email input and Continue button in parallel...", "info")
+
+                # Helper function to find element by trying multiple selectors
+                async def find_element_by_selectors(selectors):
+                    """Try multiple selectors sequentially, return first match."""
+                    for selector in selectors:
+                        try:
+                            loc = page.locator(selector)
+                            await loc.first.wait_for(state="visible", timeout=10000)
+                            return loc.first, selector
+                        except:
+                            continue
+                    return None, None
+
+                # Define selectors
+                email_selectors = [
+                    'input[type="email"]',
+                    'input[autocomplete="username"]',
+                    'input[placeholder*="example.com"]',
+                    'xpath=//input[@type="email"]',
+                ]
+
+                button_selectors = [
+                    'button[type="submit"]',
+                    'button:has-text("Continue")',
+                    '[data-testid*="primary-button"]',
+                ]
+
+                # Locate both elements in parallel
+                results = await asyncio.gather(
+                    find_element_by_selectors(email_selectors),
+                    find_element_by_selectors(button_selectors),
+                    return_exceptions=True
+                )
+
+                # Unpack results safely
+                email_result = results[0] if not isinstance(results[0], Exception) else (None, None)
+                button_result = results[1] if not isinstance(results[1], Exception) else (None, None)
+
+                email_input, email_sel = email_result if isinstance(email_result, tuple) else (None, None)
+                continue_btn, btn_sel = button_result if isinstance(button_result, tuple) else (None, None)
+
+                if email_input:
+                    log(f"Found email input with selector: {email_sel}", "ok")
+                if continue_btn:
+                    log(f"Found Continue button with selector: {btn_sel}", "ok")
+
+                if not email_input:
+                    log("Could not find email input field after trying multiple selectors", "error")
+                    log(f"Page HTML sample: {(await page.content())[:500]}", "dbg")
+                    await browser.close()
+                    return _partial("email input not found")
+
+                # Fill email
+                await _move_to_element(page, email_input)
+                await _human_type(page, email_input, email)
+                await _human_delay(0.8, 1.5)
+                log(f"Email filled: {email}", "ok")
+
+                # Click Continue button (already located if found in parallel search)
+                if continue_btn:
+                    await continue_btn.click()
+                    log("Clicked Continue button", "ok")
+                else:
+                    # Fallback: try to find button now if not found in parallel search
+                    log("Continue button not pre-located, searching now...", "warn")
+                    continue_clicked = False
+                    for selector in button_selectors:
+                        try:
+                            btn = page.locator(selector)
+                            if await btn.count() > 0:
+                                await btn.first.click()
+                                continue_clicked = True
+                                log("Clicked Continue button (fallback)", "ok")
+                                break
+                        except:
+                            pass
+
+                    if not continue_clicked:
+                        log("Trying JavaScript fallback for Continue button...", "warn")
+                        await page.evaluate("""() => {
+                            const btns = Array.from(document.querySelectorAll('button'));
+                            const vis = btns.filter(b => b.offsetWidth > 0);
+                            for (const b of vis) {
+                                const t = (b.innerText || '').toLowerCase();
+                                if (t.includes('continue') || t.includes('next')) {
+                                    b.click(); return;
+                                }
+                            }
+                        }""")
+
+                # Monitor API responses after email Continue
+                api_responses = {}
+
+                async def handle_email_response(response):
+                    url = response.url
+                    try:
+                        if '/get-config' in url:
+                            api_responses['get-config'] = {
+                                'status': response.status,
+                                'body': await response.json()
+                            }
+                        elif '/start' in url:
+                            api_responses['start'] = {
+                                'status': response.status,
+                                'body': await response.json()
+                            }
+                    except:
+                        pass
+
+                page.on("response", handle_email_response)
+                await asyncio.sleep(4)
+
+                # Log API responses
+                if 'get-config' in api_responses:
+                    cfg = api_responses['get-config']
+                    log(f"[API] get-config -> {cfg['status']} {json.dumps(cfg['body'], separators=(',', ':'))}", "dbg")
+
+                if 'start' in api_responses:
+                    st = api_responses['start']
+                    log(f"[API] start -> {st['status']} {json.dumps(st['body'], separators=(',', ':'))}", "dbg")
+
+                page.remove_listener("response", handle_email_response)
+
+                # Check if we're on the name input page
+                log("Checking for name input page...", "info")
+                name_input = None
+                for selector in [
+                    '[data-testid="signup-full-name-input"] input',
+                    'input[type="text"][placeholder*="Silva"]',
+                    'input[type="text"][autocomplete="on"]',
+                ]:
+                    try:
+                        loc = page.locator(selector)
+                        await loc.first.wait_for(state="visible", timeout=5000)
+                        name_input = loc.first
+                        log(f"Found name input with selector: {selector}", "ok")
+                        break
+                    except:
+                        continue
+
+                if name_input:
+                    # Fill name
+                    full_name = _generate_name()
+                    log(f"Filling name: {full_name}", "info")
+                    await _move_to_element(page, name_input)
+                    await _human_type(page, name_input, full_name)
+                    await _human_delay(0.8, 1.5)
+                    log(f"Name filled: {full_name}", "ok")
+
+                    # Click Continue button with TES block detection and retry
+                    max_send_otp_retries = 3
+                    send_otp_success = False
+
+                    for send_otp_attempt in range(max_send_otp_retries):
+                        log("Looking for Continue button (name page)...", "info")
+
+                        # Set up send-otp response listener
+                        send_otp_response = {}
+
+                        async def handle_sendotp_response(response):
+                            if '/send-otp' in response.url:
+                                try:
+                                    send_otp_response['status'] = response.status
+                                    send_otp_response['body'] = await response.json()
+                                except:
+                                    pass
+
+                        page.on("response", handle_sendotp_response)
+
+                        # Click Continue button
+                        continue_clicked = False
+                        for selector in [
+                            '[data-testid="signup-next-button"]',
+                            'button[type="submit"]',
+                            'button:has-text("Continue")',
+                        ]:
+                            try:
+                                btn = page.locator(selector)
+                                if await btn.count() > 0:
+                                    await btn.first.click()
+                                    continue_clicked = True
+                                    log("Clicked Continue button (name page)", "ok")
+                                    break
+                            except:
+                                pass
+
+                        if not continue_clicked:
+                            log("Trying JavaScript fallback for Continue button (name page)...", "warn")
+                            await page.evaluate("""() => {
+                                const btns = Array.from(document.querySelectorAll('button'));
+                                const vis = btns.filter(b => b.offsetWidth > 0);
+                                for (const b of vis) {
+                                    const t = (b.innerText || '').toLowerCase();
+                                    if (t.includes('continue') || t.includes('next')) {
+                                        b.click(); return;
+                                    }
+                                }
+                            }""")
+
+                        # Wait for send-otp API response
+                        await asyncio.sleep(4)
+                        page.remove_listener("response", handle_sendotp_response)
+
+                        # Check if blocked by TES
+                        if send_otp_response and send_otp_response.get('status') == 400:
+                            body = send_otp_response.get('body', {})
+                            log(f"[API] send-otp -> 400 {json.dumps(body, separators=(',', ':'))}", "dbg")
+
+                            if body.get('errorCode') == 'BLOCKED':
+                                if send_otp_attempt < max_send_otp_retries - 1:
+                                    wait_time = 2 ** (send_otp_attempt + 1)  # 2s, 4s, 8s
+                                    log(f"TES blocked registration, retrying in {wait_time}s (attempt {send_otp_attempt + 2}/{max_send_otp_retries})...", "warn")
+                                    await asyncio.sleep(wait_time)
+                                    continue  # Retry Continue button click
+                                else:
+                                    log("TES blocked registration after max retries", "error")
+                                    await browser.close()
+                                    return _partial("Blocked by AWS TES")
+                            else:
+                                # Other 400 error, not TES block
+                                send_otp_success = True
+                                break
+                        else:
+                            # Success or no response captured
+                            if send_otp_response:
+                                status = send_otp_response.get('status', '?')
+                                body = send_otp_response.get('body', {})
+                                log(f"[API] send-otp -> {status} {json.dumps(body, separators=(',', ':'))}", "dbg")
+                            send_otp_success = True
+                            break
+
+                    if not send_otp_success:
+                        log("Failed to proceed past name page", "error")
+                        await browser.close()
+                        return _partial("Name page navigation failed")
+                else:
+                    log("No name input page detected, proceeding to OTP...", "info")
+
+            # Phase 2.1: OTP verification (automated)
+            log("Waiting for OTP verification page...", "info")
+            await asyncio.sleep(3)
+
+            # Find OTP input
+            otp_input = None
+            for selector in [
+                '[data-testid="email-verification-form-code-input"]',
+                'input[placeholder*="6-digit"]',
+                'input[type="text"][autocomplete="on"]',
+                'input[inputmode="numeric"]',
+            ]:
+                try:
+                    loc = page.locator(selector)
+                    await loc.first.wait_for(state="visible", timeout=10000)
+                    otp_input = loc.first
+                    log(f"Found OTP input with selector: {selector}", "ok")
+                    break
+                except:
+                    continue
+
+            if not otp_input:
+                log("Could not find OTP input field", "error")
+                await browser.close()
+                return _partial("OTP input not found")
+
+            # Get OTP from email
+            log("Waiting for OTP code from email...", "info")
+            otp_code = ""
+            otp_deadline = time.time() + 90
+            while time.time() < otp_deadline:
+                if cancel_check and cancel_check():
+                    await browser.close()
+                    return None
+                try:
+                    otp_code = mail_provider_instance.wait_otp(timeout=5, poll_interval=3)
+                    if otp_code:
+                        break
+                except:
+                    pass
+
+            if not otp_code:
+                log("OTP code not received in time", "error")
+                await browser.close()
+                return _partial("OTP timeout")
+
+            log(f"OTP received: {otp_code}", "ok")
+
+            # Fill OTP
+            await _move_to_element(page, otp_input)
+            await otp_input.click()
+            await asyncio.sleep(0.3)
+            for ch in otp_code:
+                await page.keyboard.press(ch)
+                await asyncio.sleep(0.05 + 0.1 * secrets.randbelow(10) / 10)
+
+            log("OTP filled", "ok")
+
+            # Click Continue button (OTP page)
+            log("Looking for Continue button (OTP page)...", "info")
+            continue_clicked = False
+            for selector in [
+                '[data-testid="email-verification-verify-button"]',
+                'button[type="submit"]',
+                'button:has-text("Continue")',
+            ]:
+                try:
+                    btn = page.locator(selector)
+                    if await btn.count() > 0:
+                        await btn.first.click()
+                        continue_clicked = True
+                        log("Clicked Continue button (OTP page)", "ok")
+                        break
+                except:
+                    pass
+
+            if not continue_clicked:
+                log("Trying JavaScript fallback for Continue button (OTP page)...", "warn")
+                await page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const vis = btns.filter(b => b.offsetWidth > 0);
+                    for (const b of vis) {
+                        const t = (b.innerText || '').toLowerCase();
+                        if (t.includes('continue') || t.includes('verify')) {
+                            b.click(); return;
+                        }
+                    }
+                }""")
+
+            await asyncio.sleep(3)
+
+            # Phase 2.2: Password creation (automated)
+            log("Waiting for password creation page...", "info")
+
+            # Find password input
+            password_input = None
+            for selector in [
+                '[data-testid="test-input"] input',
+                'input[type="password"][placeholder*="password"]',
+                'input[type="password"]',
+            ]:
+                try:
+                    loc = page.locator(selector).first
+                    await loc.wait_for(state="visible", timeout=10000)
+                    password_input = loc
+                    log(f"Found password input with selector: {selector}", "ok")
+                    break
+                except:
+                    continue
+
+            if not password_input:
+                log("Could not find password input field", "error")
+                await browser.close()
+                return _partial("Password input not found")
+
+            # Generate password
+            password = _generate_password()
+            log("Filling password...", "info")
+
+            # Fill password
+            await _move_to_element(page, password_input)
+            await _human_type(page, password_input, password)
+            await _human_delay(0.5, 1.0)
+
+            # Find confirm password input
+            confirm_input = None
+            for selector in [
+                '[data-testid="test-retype-input"] input',
+                'input[type="password"][placeholder*="Re-enter"]',
+                'input[type="password"][placeholder*="Confirm"]',
+            ]:
+                try:
+                    loc = page.locator(selector).first
+                    await loc.wait_for(state="visible", timeout=5000)
+                    confirm_input = loc
+                    log(f"Found confirm password input with selector: {selector}", "ok")
+                    break
+                except:
+                    continue
+
+            if not confirm_input:
+                log("Could not find confirm password input field", "error")
+                await browser.close()
+                return _partial("Confirm password input not found")
+
+            # Fill confirm password
+            await _move_to_element(page, confirm_input)
+            await _human_type(page, confirm_input, password)
+            await _human_delay(0.8, 1.5)
+            log("Password filled", "ok")
+
+            # Click Continue button (password page)
+            log("Looking for Continue button (password page)...", "info")
+            continue_clicked = False
+            for selector in [
+                '[data-testid="test-primary-button"]',
+                'button[type="submit"]',
+                'button:has-text("Continue")',
+            ]:
+                try:
+                    btn = page.locator(selector)
+                    if await btn.count() > 0:
+                        await btn.first.click()
+                        continue_clicked = True
+                        log("Clicked Continue button (password page)", "ok")
+                        break
+                except:
+                    pass
+
+            if not continue_clicked:
+                log("Trying JavaScript fallback for Continue button (password page)...", "warn")
+                await page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const vis = btns.filter(b => b.offsetWidth > 0);
+                    for (const b of vis) {
+                        const t = (b.innerText || '').toLowerCase();
+                        if (t.includes('continue')) {
+                            b.click(); return;
+                        }
+                    }
+                }""")
+
+            await asyncio.sleep(3)
+
+            # Phase 2.3: Device authorization (automated)
+            log("Waiting for device code confirmation page...", "info")
+            await asyncio.sleep(3)
+
+            # Step 1: Confirm device code
+            confirm_button = None
+            for selector in [
+                '#cli_verification_btn',
+                'button[data-analytics="accept-user-code"]',
+                'button:has-text("Confirm and continue")',
+            ]:
+                try:
+                    btn = page.locator(selector)
+                    await btn.first.wait_for(state="visible", timeout=10000)
+                    confirm_button = btn.first
+                    log(f"Found device code confirmation button with selector: {selector}", "ok")
+                    break
+                except:
+                    continue
+
+            if not confirm_button:
+                log("Could not find device code confirmation button", "error")
+                await browser.close()
+                return _partial("Device code confirmation button not found")
+
+            await confirm_button.click()
+            log("Clicked 'Confirm and continue'", "ok")
+            await asyncio.sleep(3)
+
+            # Step 2: Allow access to Kiro
+            log("Waiting for authorization consent page...", "info")
+            allow_button = None
+            for selector in [
+                '[data-testid="allow-access-button"]',
+                'button[data-analytics="consent-allow-access"]',
+                'button:has-text("Allow access")',
+            ]:
+                try:
+                    btn = page.locator(selector)
+                    await btn.first.wait_for(state="visible", timeout=10000)
+                    allow_button = btn.first
+                    log(f"Found 'Allow access' button with selector: {selector}", "ok")
+                    break
+                except:
+                    continue
+
+            if not allow_button:
+                log("Could not find 'Allow access' button", "error")
+                await browser.close()
+                return _partial("Allow access button not found")
+
+            await allow_button.click()
+            log("Clicked 'Allow access'", "ok")
+            await asyncio.sleep(1)
+            await browser.close()
+            log("Browser closed", "ok")
+
+        except Exception as e:
+            log(f"Browser error: {e}", "error")
+            await browser.close()
+            return _partial(f"browser: {e}")
+
+    # Phase 3: Poll 9router
+    log("Phase 3: Polling 9router...")
+    poll = r9.poll_account(device_code, client_id, client_secret, code_verifier, log, 3)
+
+    exported = poll["ok"]
+    if exported:
+        log("✅ Exported to 9router!", "ok")
+    else:
+        log(f"⚠️  Export failed: {poll.get('error', 'unknown')}", "warn")
+
+    # Phase 4: Local tokens
+    if auto_login:
+        try:
+            persist_tokens(client_id, client_secret, "", "", 28800, log, email=email)
+            if skip_onboard:
+                skip_onboarding(log)
+        except Exception as e:
+            log(f"Token warning: {e}", "warn")
+
+    log("=" * 40, "ok")
+    log("9router OAuth registration complete!", "ok")
+    log(f"  Email: {email}", "ok")
+    log(f"  Exported: {exported}", "ok")
+    log("=" * 40, "ok")
+
+    return {
+        "email": email,
+        "password": password,
+        "full_name": full_name,
+        "provider": "BuilderId",
+        "authMethod": "IdC",
+        "region": region,
+        "clientId": client_id,
+        "clientSecret": client_secret,
+        "clientIdHash": _sha1_hash(client_id),
+        "accessToken": "",
+        "refreshToken": "",
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y/%m/%d %H:%M:%S"),
+        "router9_exported": exported,
+    }

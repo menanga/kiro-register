@@ -1185,6 +1185,7 @@ class App(tk.Tk):
         self._reg_pro_trial = tk.BooleanVar(value=True)
         self._reg_import_no_trial = tk.BooleanVar(value=False)
         self._reg_use_roxy = tk.BooleanVar(value=False)
+        self._use_9router_flow = tk.BooleanVar(value=False)
 
         ttk.Checkbutton(opts_frame, text="Headless", variable=self._reg_headless).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts_frame, text="Auto sign-in", variable=self._reg_auto_login).pack(side="left", padx=(0, 12))
@@ -1192,6 +1193,7 @@ class App(tk.Tk):
         ttk.Checkbutton(opts_frame, text="ProTrial subscription", variable=self._reg_pro_trial).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts_frame, text="Persist even without a trial", variable=self._reg_import_no_trial).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts_frame, text="Fingerprint browser", variable=self._reg_use_roxy).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(opts_frame, text="Use 9router OAuth Flow", variable=self._use_9router_flow).pack(side="left", padx=(0, 12))
 
         btn_frame = ttk.Frame(opts_frame)
         btn_frame.pack(side="right")
@@ -1618,6 +1620,28 @@ class App(tk.Tk):
                 self._reg_import_to_db(result)
                 self._reg_queue.put(("Account auto-imported into the database", "ok"))
                 self._refresh_after_import(result.get("email", ""), self._reg_queue)
+
+                # Auto-export to 9router if enabled
+                cfg = load_config()
+                if cfg.get("enable_9router_export", False):
+                    try:
+                        from router9_export import Router9Exporter
+                        exporter = Router9Exporter(
+                            base_url=cfg.get("router9_url", "http://localhost:20128"),
+                            verify_ssl=cfg.get("router9_verify_ssl", True)
+                        )
+                        if exporter.check_connection():
+                            export_result = exporter.export_account_result(result, log=self._reg_log)
+                            if export_result["ok"]:
+                                self._reg_queue.put(("✓ Account exported to 9router", "ok"))
+                            else:
+                                self._reg_queue.put((f"9router export failed: {export_result.get('error', 'unknown')}", "warn"))
+                        else:
+                            self._reg_queue.put(("9router not accessible; skipping export", "warn"))
+                    except ImportError:
+                        self._reg_queue.put(("router9_export.py not found; skipping 9router export", "warn"))
+                    except Exception as e:
+                        self._reg_queue.put((f"9router export error: {e}", "err"))
             except Exception as e:
                 self._reg_queue.put((f"Database import failed: {e}", "err"))
             self.after(0, self._load_accounts_from_db)
@@ -1912,15 +1936,50 @@ class App(tk.Tk):
             )
         else:
             import kiro_register
-            return await kiro_register.register(
-                headless=headless,
-                auto_login=auto_login,
-                skip_onboard=skip_onboard,
-                mail_provider_instance=mail_instance,
-                proxy_url=proxy_url,
-                log=self._reg_log,
-                cancel_check=lambda: self._reg_cancel,
-            )
+
+            # Check if 9router OAuth flow is enabled
+            if self._use_9router_flow.get():
+                cfg = load_config()
+                router9_config = {
+                    "base_url": cfg.get("router9_url", "http://localhost:20128"),
+                    "password": cfg.get("router9_password", ""),
+                    "auth_token": cfg.get("router9_auth_token", ""),
+                    "auth_token_expires_at": cfg.get("router9_auth_token_expires_at", ""),
+                }
+
+                if not router9_config["password"]:
+                    self._reg_log("9router password not configured in kiro_config.json", "err")
+                    return None
+
+                result = await kiro_register.register_via_9router_oauth(
+                    headless=headless,
+                    auto_login=auto_login,
+                    skip_onboard=skip_onboard,
+                    mail_provider_instance=mail_instance,
+                    router9_config=router9_config,
+                    proxy_url=proxy_url,
+                    log=self._reg_log,
+                    cancel_check=lambda: self._reg_cancel,
+                )
+
+                # Update cached auth token in config if refreshed
+                if result and router9_config.get("auth_token"):
+                    cfg["router9_auth_token"] = router9_config["auth_token"]
+                    cfg["router9_auth_token_expires_at"] = router9_config["auth_token_expires_at"]
+                    save_config(cfg)
+
+                return result
+            else:
+                # Original registration flow
+                return await kiro_register.register(
+                    headless=headless,
+                    auto_login=auto_login,
+                    skip_onboard=skip_onboard,
+                    mail_provider_instance=mail_instance,
+                    proxy_url=proxy_url,
+                    log=self._reg_log,
+                    cancel_check=lambda: self._reg_cancel,
+                )
 
     async def _reg_pro_trial_subscribe(self, result, loop):
         """After registration, automatically subscribe to the Pro trial (using an EFunCard virtual credit card)"""
