@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Database and runtime
+*.db
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Git
+.git/
+
+# Build
+build/
+dist/
+*.exe
+
+# Docs
+*.md
+!README.md

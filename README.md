@@ -56,20 +56,86 @@ python -m playwright install chromium
 | `cryptography` | Token encryption at rest |
 | `tkinter` | Desktop GUI (bundled with Python; `apt install python3-tk` on Linux) |
 
-## Running the tool
+## Usage Overview
 
+This project offers two ways to run:
+
+| Mode | Use Case | How to Run |
+|------|----------|------------|
+| **GUI** (`main.py`) | Interactive use, testing, manual control, viewing account details | `python main.py` |
+| **Service** (`service.py`) | Automated batch registration, scheduled runs, headless servers, Docker | `python service.py --batch 10` |
+
+**Choose GUI if:** You want to interactively configure settings, test mail providers, monitor progress visually, or manage existing accounts.
+
+**Choose Service if:** You want automated batch registration, continuous operation, scheduled runs via cron/systemd, or deployment in Docker containers.
+
+---
+
+## Running the GUI (`main.py`)
+
+### Launch the GUI
 ```bash
 python main.py
 ```
 
-A desktop window opens. On first launch the app generates `kiro_config.json` next to `main.py` — that's where your mail-provider settings, YesCaptcha key, and CDK codes live. The file is gitignored and never committed.
+A desktop window opens with multiple tabs. On first launch, the app generates `kiro_config.json` — your mail provider settings, API keys, and proxy configuration are stored here (gitignored).
 
-### First-run checklist inside the GUI
+### Step-by-Step: First Run Setup
 
-1. **Mail provider tab.** Pick a provider (ShiroMail, YYDSMail, or **Gsuite/IMAP (self-hosted)**), fill its configuration, choose a domain (where applicable), click *Test*.
-2. **Captcha tab (optional).** Paste an API key for either **YesCaptcha** or **Multibot**, then pick the active provider from the dropdown. Without any key the tool falls back to manual solving and registration will pause for you.
-3. **Registration tab.** Set the concurrency, pick headless or headed mode, click *Start*. Progress streams into the log pane.
-4. **Accounts tab.** Inspect every account's token, expiry, trial status, and ban state. Refresh or re-subscribe from the toolbar.
+#### 1. Configure Mail Provider (Required)
+Navigate to the **Mail Provider** tab:
+
+- **For paid temp-mail services (ShiroMail/YYDSMail):**
+  1. Select provider from dropdown
+  2. Enter API base URL and API key
+  3. Click **Refresh Domains** to load available domains
+  4. Select a domain from the dropdown
+  5. Click **Test** to verify the connection
+
+- **For self-hosted Gmail/IMAP catch-all (recommended):**
+  1. Select **Gsuite/IMAP (self-hosted)**
+  2. Fill IMAP settings:
+     - Host: `imap.gmail.com`
+     - Port: `993`
+     - User: your Gmail address
+     - Pass: [Google App Password](https://support.google.com/accounts/answer/185833) (not your regular password)
+     - Domains file: path to `domains.txt` (one domain per line)
+  3. Click **Test** to verify IMAP connection
+
+#### 2. Configure Captcha (Optional)
+Navigate to the **Captcha** tab:
+
+- Without a captcha API key, the tool uses **manual solving** — registration will pause and wait for you to solve the captcha in the browser window
+- For automatic solving:
+  1. Get an API key from [YesCaptcha](https://yescaptcha.com) or [Multibot](https://multibot.cloud)
+  2. Paste the key into the appropriate field
+  3. Select the active provider from the dropdown
+  4. The tool will now solve captchas automatically
+
+#### 3. Start Registration
+Navigate to the **Registration** tab:
+
+1. **Concurrency:** Set how many accounts to register in parallel (1-5 recommended; higher = faster but more likely to trigger TES blocks)
+2. **Headless mode:** Check this to hide browser windows (faster, uses less memory)
+3. **9router OAuth flow:** Check this to use 9router OAuth flow with automatic export
+4. Click **Start** — progress streams into the log pane
+5. Click **Stop** to gracefully halt registration
+
+#### 4. Manage Accounts
+Navigate to the **Accounts** tab:
+
+- View all registered accounts with their email, token status, expiry, and ban state
+- **Refresh token:** Right-click an account → Refresh
+- **Delete account:** Right-click an account → Delete
+- **Export accounts:** Use the toolbar to export account data
+
+#### 5. Configure Proxy (Recommended)
+Navigate to the **Settings** tab:
+
+- Paste a residential proxy URL: `http://user:pass@host:port`
+- This routes browser traffic through the proxy to avoid AWS TES blocks
+- Without a proxy, datacenter IPs are more likely to be flagged
+- Proxy setting is saved to `kiro_config.json`
 
 ### Self-hosted mail with Gsuite/IMAP catch-all
 
@@ -81,6 +147,74 @@ If you own a pool of domains whose MX records catch-all forward into a Gmail or 
 4. In the GUI pick *Gsuite/IMAP (self-hosted)* and fill IMAP host (`imap.gmail.com`), port (`993`), user (`you@gmail.com`), pass (the app password), and the path to `domains.txt`.
 
 Registration then invents a unique `<random>@<random-domain>` alias per account, polls the inbox by `To:` header, and extracts the 6-digit OTP automatically.
+
+## Headless Batch/Service Mode (`service.py`)
+
+For automated registration without the GUI, use `service.py` — a headless runner that supports three modes:
+
+### Batch Mode
+Register exactly N accounts then stop:
+```bash
+python service.py --batch 10 --delay 300 --headless --9router
+```
+
+### Batch-Loop Mode (NEW!)
+Register N accounts per batch, wait, then repeat infinitely — perfect for continuous registration with rate limiting:
+```bash
+python service.py --batch-loop 10 --delay 300 --batch-delay 3600 --headless --9router
+```
+- `--batch-loop 10` — 10 accounts per batch
+- `--delay 300` — 5 minutes between each account
+- `--batch-delay 3600` — 1 hour between batches (default)
+
+Press `Ctrl+C` to stop. Statistics are displayed.
+
+### Service Mode
+Register continuously until `Ctrl+C`:
+```bash
+python service.py --service --delay 300 --headless --9router
+```
+
+### Command Reference
+
+**Required (choose one):**
+- `--batch N` — Register N accounts then stop
+- `--batch-loop N` — Register N accounts per batch, repeat infinitely
+- `--service` — Register continuously
+
+**Optional:**
+- `--delay SEC` — Delay between account registrations (default: 10s)
+- `--batch-delay SEC` — Delay between batches in batch-loop mode (default: 3600s)
+- `--9router` — Use 9router OAuth flow for automatic export
+- `--headless` — Run browser in headless mode (recommended for automation)
+
+## Docker Support
+
+Run the headless service in a container:
+
+### Build and run
+```bash
+# Build image
+docker-compose build
+
+# Batch-loop mode: 10 accounts/batch, 5min delays, 1hr between batches
+docker-compose run --rm kiro-service python service.py \
+  --batch-loop 10 \
+  --delay 300 \
+  --batch-delay 3600 \
+  --headless \
+  --9router
+
+# Batch mode: 10 accounts then stop
+docker-compose run --rm kiro-service python service.py --batch 10 --delay 300 --headless --9router
+
+# Service mode: infinite loop
+docker-compose run --rm kiro-service python service.py --service --delay 300 --headless --9router
+```
+
+The container mounts your project directory, so `kiro_config.json`, `accounts.db`, and `domains.txt` are read from and written to your local filesystem.
+
+**Note:** The GUI (main.py) requires X11/VNC setup in Docker, which adds significant complexity. Recommended approach: run the GUI locally, use Docker only for headless service mode.
 
 ## Packaging a Windows .exe
 

@@ -1,0 +1,36 @@
+services:
+  kiro-service:
+    build: .
+    container_name: kiro-register-service
+    volumes:
+      # Mount config and data directory
+      - ./:/app
+      - kiro-data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Override command with your desired options
+    command: python service.py --batch 10 --delay 600 --headless --9router
+    # Uncomment for interactive mode
+    # stdin_open: true
+    # tty: true
+
+volumes:
+  kiro-data:
+    driver: local
+
+# Usage examples:
+#
+# Build image:
+#   docker-compose build
+#
+# Run batch mode (10 accounts, 5min delay):
+#   docker-compose run --rm kiro-service python service.py --batch 10 --delay 300 --headless --9router
+#
+# Run service mode (infinite):
+#   docker-compose run --rm kiro-service python service.py --service --delay 300 --headless --9router
+#
+# Run batch-loop mode (10 accounts per batch, 5min between accounts, 1hr between batches):
+#   docker-compose run --rm kiro-service python service.py --batch-loop 10 --delay 300 --batch-delay 3600 --headless --9router
+#
+# Interactive shell:
+#   docker-compose run --rm kiro-service bash

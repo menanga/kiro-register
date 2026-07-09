@@ -15,7 +15,7 @@ import asyncio
 import json
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from kiro_register import register, register_via_9router_oauth
@@ -194,28 +194,103 @@ def run_service(delay, use_9router, headless):
         print_stats("SERVICE", None, successful, failed, total)
 
 
+def run_batch_loop(count, account_delay, batch_delay, use_9router, headless):
+    """Batch loop mode - register N accounts per batch, wait, repeat infinitely."""
+    config = load_config()
+
+    print("\n" + "=" * 70)
+    print("  K.I.R.O BATCH LOOP MODE")
+    print("=" * 70)
+    print(f"  Accounts per batch: {count}")
+    print(f"  Account delay: {account_delay}s")
+    print(f"  Batch delay: {batch_delay}s")
+    print(f"  Flow: {'9router OAuth' if use_9router else 'Standard'}")
+    print(f"  Browser: {'Headless' if headless else 'Headed'}")
+    print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Stop: Press Ctrl+C")
+    print("=" * 70)
+
+    batch_num = 0
+    total_successful = 0
+    total_failed = 0
+    total_accounts = 0
+
+    try:
+        while True:
+            batch_num += 1
+            batch_successful = 0
+            batch_failed = 0
+
+            print(f"\n{'='*70}")
+            print(f"  BATCH #{batch_num}")
+            print(f"{'='*70}")
+
+            for i in range(1, count + 1):
+                total_accounts += 1
+                if register_one(config, use_9router, headless, i, count):
+                    batch_successful += 1
+                    total_successful += 1
+                else:
+                    batch_failed += 1
+                    total_failed += 1
+
+                # Wait between accounts (except after last account in batch)
+                if i < count:
+                    print(f"\n⏳ Waiting {account_delay}s...")
+                    time.sleep(account_delay)
+
+            # Batch complete
+            print(f"\n{'='*70}")
+            print(f"  BATCH #{batch_num} COMPLETE")
+            print(f"  Success: {batch_successful}/{count} | Failed: {batch_failed}/{count}")
+            print(f"  Total so far: {total_successful} success, {total_failed} failed")
+            print(f"{'='*70}")
+
+            # Wait before next batch
+            next_batch_time = (datetime.now() + timedelta(seconds=batch_delay)).strftime('%H:%M:%S')
+            print(f"\n⏳ Waiting {batch_delay}s until next batch (starting ~{next_batch_time})...")
+            time.sleep(batch_delay)
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 Stopped by user (Ctrl+C)")
+        print(f"\n{'='*70}")
+        print(f"  BATCH LOOP SUMMARY")
+        print(f"{'='*70}")
+        print(f"  Batches completed: {batch_num}")
+        print(f"  Total accounts: {total_accounts}")
+        print(f"  Success: {total_successful} ({100*total_successful//total_accounts if total_accounts else 0}%)")
+        print(f"  Failed: {total_failed}")
+        print(f"{'='*70}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="K.I.R.O Register - Batch/Service Mode",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python service.py --batch 10              # 10 accounts
-  python service.py --service               # Infinite loop
-  python service.py --batch 50 --delay 30   # 50 accounts, 30s delay
-  python service.py --service --9router     # Service with 9router OAuth
-  python service.py --batch 100 --headless  # Headless browser
+  python service.py --batch 10                              # 10 accounts then stop
+  python service.py --service                               # Infinite loop
+  python service.py --batch 50 --delay 30                   # 50 accounts, 30s delay
+  python service.py --batch-loop 10 --delay 300             # 10 accounts/batch, 5min delay, 1hr between batches (default)
+  python service.py --batch-loop 10 --delay 300 --batch-delay 7200  # Custom 2hr batch delay
+  python service.py --service --9router                     # Service with 9router OAuth
+  python service.py --batch 100 --headless                  # Headless browser
         """
     )
 
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--batch", type=int, metavar="N",
                      help="Batch mode: register N accounts then stop")
+    mode.add_argument("--batch-loop", type=int, metavar="N", dest="batch_loop",
+                     help="Batch loop mode: register N accounts per batch, repeat infinitely")
     mode.add_argument("--service", action="store_true",
                      help="Service mode: infinite loop until Ctrl+C")
 
     parser.add_argument("--delay", type=int, default=10, metavar="SEC",
                        help="Delay between registrations (default: 10s)")
+    parser.add_argument("--batch-delay", type=int, default=3600, metavar="SEC",
+                       help="Delay between batches in --batch-loop mode (default: 3600s=1hr)")
     parser.add_argument("--9router", dest="use_9router", action="store_true",
                        help="Use 9router OAuth flow")
     parser.add_argument("--headless", action="store_true",
@@ -231,9 +306,19 @@ Examples:
         print("❌ --batch must be at least 1")
         sys.exit(1)
 
+    if args.batch_loop and args.batch_loop < 1:
+        print("❌ --batch-loop must be at least 1")
+        sys.exit(1)
+
+    if args.batch_delay and args.batch_delay < 1:
+        print("❌ --batch-delay must be at least 1 second")
+        sys.exit(1)
+
     try:
         if args.batch:
             run_batch(args.batch, args.delay, args.use_9router, args.headless)
+        elif args.batch_loop:
+            run_batch_loop(args.batch_loop, args.delay, args.batch_delay, args.use_9router, args.headless)
         else:
             run_service(args.delay, args.use_9router, args.headless)
     except KeyboardInterrupt:
