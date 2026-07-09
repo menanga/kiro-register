@@ -196,11 +196,12 @@ class GsuiteImapProvider(MailProvider):
             # Narrow to messages delivered after create_mailbox().
             # IMAP SINCE granularity is day-level, so we always fetch at least
             # the current day and then filter in-memory by the actual timestamp.
+            # Changed: Using 10 minutes window instead of 24 hours for faster, focused search
             since_date = time.strftime(
-                "%d-%b-%Y", time.gmtime(max(self._created_at - 86400, 0))
+                "%d-%b-%Y", time.gmtime(max(self._created_at - 600, 0))
             )
 
-            # DEBUG: Try compound search first
+            # Search for TO + SINCE (10 minutes window)
             print(f"[IMAP DEBUG] Searching for TO:{target_address} SINCE:{since_date}")
             status, data = imap.uid(
                 "SEARCH", None, f'(SINCE "{since_date}" TO "{target_address}")'
@@ -210,21 +211,22 @@ class GsuiteImapProvider(MailProvider):
                 uids = data[0].decode(errors="ignore").split()
                 print(f"[IMAP DEBUG] Compound search found {len(uids)} messages")
 
-            # Fallback: some IMAP servers dislike the compound query above.
-            if not uids:
-                print(f"[IMAP DEBUG] Trying fallback search (TO only)...")
-                status, data = imap.uid("SEARCH", None, f'(TO "{target_address}")')
-                if status == "OK" and data and data[0]:
-                    uids = data[0].decode(errors="ignore").split()
-                    print(f"[IMAP DEBUG] Fallback search found {len(uids)} messages")
-
-            # If still no results, try searching ALL recent messages (last 24h)
-            if not uids:
-                print(f"[IMAP DEBUG] Trying broad search (SINCE only)...")
-                status, data = imap.uid("SEARCH", None, f'(SINCE "{since_date}")')
-                if status == "OK" and data and data[0]:
-                    uids = data[0].decode(errors="ignore").split()
-                    print(f"[IMAP DEBUG] Broad search found {len(uids)} messages")
+            # COMMENTED: Fallback searches disabled for faster, focused search
+            # # Fallback: some IMAP servers dislike the compound query above.
+            # if not uids:
+            #     print(f"[IMAP DEBUG] Trying fallback search (TO only)...")
+            #     status, data = imap.uid("SEARCH", None, f'(TO "{target_address}")')
+            #     if status == "OK" and data and data[0]:
+            #         uids = data[0].decode(errors="ignore").split()
+            #         print(f"[IMAP DEBUG] Fallback search found {len(uids)} messages")
+            #
+            # # If still no results, try searching ALL recent messages (last 24h)
+            # if not uids:
+            #     print(f"[IMAP DEBUG] Trying broad search (SINCE only)...")
+            #     status, data = imap.uid("SEARCH", None, f'(SINCE "{since_date}")')
+            #     if status == "OK" and data and data[0]:
+            #         uids = data[0].decode(errors="ignore").split()
+            #         print(f"[IMAP DEBUG] Broad search found {len(uids)} messages")
 
             # Scan newest first so we get the most recent OTP.
             for uid in reversed(uids):

@@ -2007,24 +2007,36 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             # Phase 2.2: Password creation (automated)
             log("Waiting for password creation page...", "info")
 
-            # Find password input
+            # Wait for password page to load and find input (with retry)
             password_input = None
-            for selector in [
-                '[data-testid="test-input"] input',
-                'input[type="password"][placeholder*="password"]',
-                'input[type="password"]',
-            ]:
-                try:
-                    loc = page.locator(selector).first
-                    await loc.wait_for(state="visible", timeout=10000)
-                    password_input = loc
-                    log(f"Found password input with selector: {selector}", "ok")
+            password_deadline = time.time() + 60  # 60 second timeout
+            attempt = 0
+
+            while time.time() < password_deadline and not password_input:
+                attempt += 1
+                if attempt > 1:
+                    log(f"Retry {attempt} - waiting for password page...", "info")
+                    await asyncio.sleep(3)
+
+                for selector in [
+                    '[data-testid="test-input"] input',
+                    'input[type="password"][placeholder*="password"]',
+                    'input[type="password"]',
+                ]:
+                    try:
+                        loc = page.locator(selector).first
+                        await loc.wait_for(state="visible", timeout=5000)  # 5 second timeout per selector
+                        password_input = loc
+                        log(f"Found password input with selector: {selector}", "ok")
+                        break
+                    except:
+                        continue
+
+                if password_input:
                     break
-                except:
-                    continue
 
             if not password_input:
-                log("Could not find password input field", "error")
+                log("Could not find password input field after retries", "error")
                 await browser.close()
                 return _partial("Password input not found")
 
@@ -2037,24 +2049,36 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             await _human_type(page, password_input, password)
             await _human_delay(0.5, 1.0)
 
-            # Find confirm password input
+            # Find confirm password input (with retry)
             confirm_input = None
-            for selector in [
-                '[data-testid="test-retype-input"] input',
-                'input[type="password"][placeholder*="Re-enter"]',
-                'input[type="password"][placeholder*="Confirm"]',
-            ]:
-                try:
-                    loc = page.locator(selector).first
-                    await loc.wait_for(state="visible", timeout=5000)
-                    confirm_input = loc
-                    log(f"Found confirm password input with selector: {selector}", "ok")
+            confirm_deadline = time.time() + 30  # 30 second timeout
+            attempt = 0
+
+            while time.time() < confirm_deadline and not confirm_input:
+                attempt += 1
+                if attempt > 1:
+                    log(f"Retry {attempt} - waiting for confirm password field...", "info")
+                    await asyncio.sleep(2)
+
+                for selector in [
+                    '[data-testid="test-retype-input"] input',
+                    'input[type="password"][placeholder*="Re-enter"]',
+                    'input[type="password"][placeholder*="Confirm"]',
+                ]:
+                    try:
+                        loc = page.locator(selector).first
+                        await loc.wait_for(state="visible", timeout=3000)
+                        confirm_input = loc
+                        log(f"Found confirm password input with selector: {selector}", "ok")
+                        break
+                    except:
+                        continue
+
+                if confirm_input:
                     break
-                except:
-                    continue
 
             if not confirm_input:
-                log("Could not find confirm password input field", "error")
+                log("Could not find confirm password input field after retries", "error")
                 await browser.close()
                 return _partial("Confirm password input not found")
 
