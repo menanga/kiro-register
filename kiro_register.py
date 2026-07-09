@@ -1916,9 +1916,48 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     pass
 
             if not otp_code:
-                log("OTP code not received in time", "error")
-                await browser.close()
-                return _partial("OTP timeout")
+                # Try to resend OTP and retry once
+                log("No OTP received, attempting to resend...", "warn")
+                resend_clicked = False
+
+                # Look for Resend button
+                for selector in [
+                    'button:has-text("Resend")',
+                    'button:has-text("Send again")',
+                    'a:has-text("Resend code")',
+                    'a:has-text("Didn\'t receive")',
+                ]:
+                    try:
+                        btn = page.locator(selector)
+                        if await btn.count() > 0:
+                            await btn.first.click()
+                            resend_clicked = True
+                            log("Clicked Resend OTP button", "ok")
+                            await asyncio.sleep(3)
+                            break
+                    except:
+                        pass
+
+                if resend_clicked:
+                    # Retry waiting for OTP (60s second attempt)
+                    log("Waiting for OTP after resend...", "info")
+                    otp_deadline = time.time() + 60
+                    while time.time() < otp_deadline:
+                        if cancel_check and cancel_check():
+                            await browser.close()
+                            return None
+                        try:
+                            otp_code = mail_provider_instance.wait_otp(timeout=5, poll_interval=3)
+                            if otp_code:
+                                log(f"OTP received after resend: {otp_code}", "ok")
+                                break
+                        except:
+                            pass
+
+                if not otp_code:
+                    log("OTP not received even after resend attempt", "error")
+                    await browser.close()
+                    return _partial("OTP timeout")
 
             log(f"OTP received: {otp_code}", "ok")
 

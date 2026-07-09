@@ -199,18 +199,32 @@ class GsuiteImapProvider(MailProvider):
             since_date = time.strftime(
                 "%d-%b-%Y", time.gmtime(max(self._created_at - 86400, 0))
             )
+
+            # DEBUG: Try compound search first
+            print(f"[IMAP DEBUG] Searching for TO:{target_address} SINCE:{since_date}")
             status, data = imap.uid(
                 "SEARCH", None, f'(SINCE "{since_date}" TO "{target_address}")'
             )
             uids: list[str] = []
             if status == "OK" and data and data[0]:
                 uids = data[0].decode(errors="ignore").split()
+                print(f"[IMAP DEBUG] Compound search found {len(uids)} messages")
 
             # Fallback: some IMAP servers dislike the compound query above.
             if not uids:
+                print(f"[IMAP DEBUG] Trying fallback search (TO only)...")
                 status, data = imap.uid("SEARCH", None, f'(TO "{target_address}")')
                 if status == "OK" and data and data[0]:
                     uids = data[0].decode(errors="ignore").split()
+                    print(f"[IMAP DEBUG] Fallback search found {len(uids)} messages")
+
+            # If still no results, try searching ALL recent messages (last 24h)
+            if not uids:
+                print(f"[IMAP DEBUG] Trying broad search (SINCE only)...")
+                status, data = imap.uid("SEARCH", None, f'(SINCE "{since_date}")')
+                if status == "OK" and data and data[0]:
+                    uids = data[0].decode(errors="ignore").split()
+                    print(f"[IMAP DEBUG] Broad search found {len(uids)} messages")
 
             # Scan newest first so we get the most recent OTP.
             for uid in reversed(uids):
@@ -225,6 +239,11 @@ class GsuiteImapProvider(MailProvider):
                     continue
                 msg = email.message_from_bytes(raw)
 
+                # DEBUG: Log message headers
+                from_addr = _decode_header_value(msg.get("From", ""))
+                subject = _decode_header_value(msg.get("Subject", ""))
+                print(f"[IMAP DEBUG] Message UID:{uid} From:{from_addr[:50]} Subject:{subject[:50]}")
+
                 # Sanity: the `To:` (or `Delivered-To:` / `X-Original-To:`)
                 # header should mention the target alias. Catch-all setups
                 # keep the alias in the `To:` header, Cloudflare Routing
@@ -234,25 +253,33 @@ class GsuiteImapProvider(MailProvider):
                     for h in ("To", "Delivered-To", "X-Original-To",
                               "X-Forwarded-To", "X-Delivered-To")
                 ).lower()
+
+                print(f"[IMAP DEBUG]   To headers: {to_haystack[:100]}")
+
                 if target_address not in to_haystack:
+                    print(f"[IMAP DEBUG]   ❌ SKIPPED: Target address not in To headers")
                     continue
 
                 # Timestamp filter: ignore pre-mailbox-creation messages.
                 ts = self._message_epoch(msg)
                 if ts and ts + 5 < self._created_at:
+                    print(f"[IMAP DEBUG]   ❌ SKIPPED: Message too old (ts={ts}, created={self._created_at})")
                     continue
 
                 # Prefer the subject line (many OTP emails put the code in the
                 # subject, e.g. "Your verification code is 123456").
-                subject = _decode_header_value(msg.get("Subject", ""))
                 m = re.search(r"\b(\d{6})\b", subject)
                 if m:
+                    print(f"[IMAP DEBUG]   ✅ FOUND OTP in subject: {m.group(1)}")
                     return m.group(1)
 
                 for body in _extract_bodies(msg):
                     m = re.search(r"\b(\d{6})\b", body)
                     if m:
+                        print(f"[IMAP DEBUG]   ✅ FOUND OTP in body: {m.group(1)}")
                         return m.group(1)
+
+                print(f"[IMAP DEBUG]   ⚠️  No 6-digit code found in this message")
         finally:
             try:
                 imap.close()
