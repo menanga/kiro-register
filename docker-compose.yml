@@ -9,7 +9,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     # Override command with your desired options
-    command: python service.py --batch 10 --delay 600 --headless --9router
+    command: python service.py --batch-loop 10 --delay 600 --batch-delay 3600 --headless --9router
     # Uncomment for interactive mode
     # stdin_open: true
     # tty: true

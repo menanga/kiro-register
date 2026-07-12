@@ -6,7 +6,8 @@
       "mcp__plugin_ecc_github__get_file_contents",
       "mcp__plugin_ecc_github__search_code",
       "Bash(sqlite3 *)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(chmod +x *)"
     ],
     "allowed": [
       "python *",
