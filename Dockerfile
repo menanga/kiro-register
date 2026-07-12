@@ -27,6 +27,6 @@ VOLUME ["/data", "/config"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
 
-# Default command
-ENTRYPOINT ["python", "service.py"]
-CMD ["--help"]
+# Default command (service mode with 60s delay and 9router)
+# Override in Dokploy Command field with: python service.py --batch 10 --9router
+CMD ["python", "service.py", "--service", "--delay", "300", "--9router"]
