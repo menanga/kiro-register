@@ -228,7 +228,8 @@ class GsuiteImapProvider(MailProvider):
 
             # Search for TO + SINCE (10 minutes window)
             # Search by SINCE + FROM only (TO filter unreliable with catch-all forwarding)
-            search_query = f'(SINCE "{since_date}" FROM "no-reply@amazonaws.com")'
+            # AWS sends OTP from both no-reply@amazonaws.com and no-reply@signin.aws
+            search_query = f'(SINCE "{since_date}" OR FROM "no-reply@amazonaws.com" FROM "no-reply@signin.aws")'
             print(f"[IMAP DEBUG] ========== Search Phase ==========", flush=True)
             print(f"[IMAP DEBUG] SINCE date: {since_date}", flush=True)
             print(f"[IMAP DEBUG] Search query: {search_query}", flush=True)
@@ -246,22 +247,15 @@ class GsuiteImapProvider(MailProvider):
             else:
                 print(f"[IMAP DEBUG] Search returned no results (status={status}, data={data})", flush=True)
 
-            # COMMENTED: Fallback searches disabled for faster, focused search
-            # # Fallback: some IMAP servers dislike the compound query above.
-            # if not uids:
-            #     print(f"[IMAP DEBUG] Trying fallback search (TO only)...", flush=True)
-            #     status, data = imap.uid("SEARCH", None, f'(TO "{target_address}")')
-            #     if status == "OK" and data and data[0]:
-            #         uids = data[0].decode(errors="ignore").split()
-            #         print(f"[IMAP DEBUG] Fallback search found {len(uids)} messages", flush=True)
-            #
-            # # If still no results, try searching ALL recent messages (last 24h)
-            # if not uids:
-            #     print(f"[IMAP DEBUG] Trying broad search (SINCE only)...", flush=True)
-            #     status, data = imap.uid("SEARCH", None, f'(SINCE "{since_date}")')
-            #     if status == "OK" and data and data[0]:
-            #         uids = data[0].decode(errors="ignore").split()
-            #         print(f"[IMAP DEBUG] Broad search found {len(uids)} messages", flush=True)
+            # Fallback: search by subject if FROM search fails
+            if not uids:
+                print(f"[IMAP DEBUG] Trying fallback search by SUBJECT...", flush=True)
+                subject_query = f'(SINCE "{since_date}" SUBJECT "Verify your AWS Builder ID email address")'
+                print(f"[IMAP DEBUG] Fallback query: {subject_query}", flush=True)
+                status, data = imap.uid("SEARCH", None, subject_query)
+                if status == "OK" and data and data[0]:
+                    uids = data[0].decode(errors="ignore").split()
+                    print(f"[IMAP DEBUG] Fallback search found {len(uids)} messages", flush=True)
 
             # Scan newest first so we get the most recent OTP.
             unseen_uids = [uid for uid in reversed(uids) if uid not in self._seen_uids]
@@ -310,16 +304,16 @@ class GsuiteImapProvider(MailProvider):
                 # subject, e.g. "Your verification code is 123456").
                 m = re.search(r"\b(\d{6})\b", subject)
                 if m:
-                    print(f"[IMAP DEBUG]   ✅ FOUND OTP in subject: {m.group(1)}", flush=True)
+                    print(f"[IMAP DEBUG]   FOUND OTP in subject: {m.group(1)}", flush=True)
                     return m.group(1)
 
                 for body in _extract_bodies(msg):
                     m = re.search(r"\b(\d{6})\b", body)
                     if m:
-                        print(f"[IMAP DEBUG]   ✅ FOUND OTP in body: {m.group(1)}", flush=True)
+                        print(f"[IMAP DEBUG]   FOUND OTP in body: {m.group(1)}", flush=True)
                         return m.group(1)
 
-                print(f"[IMAP DEBUG]   ⚠️  No 6-digit code found in this message", flush=True)
+                print(f"[IMAP DEBUG]   No 6-digit code found in this message", flush=True)
 
             print(f"[IMAP DEBUG] Poll iteration complete - no OTP found in {len(unseen_uids)} unseen messages", flush=True)
             return ""
