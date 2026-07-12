@@ -14,10 +14,111 @@ import argparse
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Database configuration
+DB_PATH = Path(os.getenv("DB_PATH", "kiro_accounts.db"))
+
+DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT DEFAULT '',
+    provider TEXT DEFAULT '',
+    authMethod TEXT DEFAULT '',
+    accessToken TEXT,
+    refreshToken TEXT,
+    expiresAt TEXT,
+    clientId TEXT,
+    clientSecret TEXT,
+    clientIdHash TEXT,
+    region TEXT DEFAULT 'us-east-1',
+    profileArn TEXT,
+    userId TEXT,
+    usageLimit INTEGER DEFAULT 0,
+    currentUsage INTEGER DEFAULT 0,
+    overageCap INTEGER DEFAULT 0,
+    currentOverages INTEGER DEFAULT 0,
+    overageStatus TEXT,
+    overageCharges REAL DEFAULT 0.0,
+    subscription TEXT DEFAULT '',
+    lastQueryTime TEXT,
+    createdAt TEXT DEFAULT (datetime('now','localtime')),
+    updatedAt TEXT DEFAULT (datetime('now','localtime'))
+);
+"""
+
+
+def get_db():
+    """Initialize database connection and schema"""
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(DB_SCHEMA)
+    # Migration: add subscription/password columns if missing
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()]
+    if "subscription" not in cols:
+        conn.execute("ALTER TABLE accounts ADD COLUMN subscription TEXT DEFAULT ''")
+    if "password" not in cols:
+        conn.execute("ALTER TABLE accounts ADD COLUMN password TEXT DEFAULT ''")
+    conn.commit()
+    return conn
+
+
+def save_account(result: dict):
+    """Save successful registration to database"""
+    try:
+        conn = get_db()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        email = result.get("email")
+        if not email:
+            print("⚠️  No email in result, skipping DB save")
+            return
+
+        # Check if exists
+        existing = conn.execute("SELECT id FROM accounts WHERE email=?", (email,)).fetchone()
+
+        if existing:
+            print(f"ℹ️  Account already exists in DB: {email}")
+            conn.close()
+            return
+
+        # Insert new account
+        conn.execute("""
+            INSERT INTO accounts (
+                email, provider, authMethod, accessToken, refreshToken,
+                expiresAt, clientId, clientSecret, clientIdHash, region,
+                profileArn, userId, subscription, updatedAt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            email,
+            result.get("provider", "aws"),
+            result.get("authMethod", "oauth"),
+            result.get("accessToken", ""),
+            result.get("refreshToken", ""),
+            result.get("expiresAt", ""),
+            result.get("clientId", ""),
+            result.get("clientSecret", ""),
+            result.get("clientIdHash", ""),
+            result.get("region", "us-east-1"),
+            result.get("profileArn", ""),
+            result.get("userId", ""),
+            result.get("subscription", ""),
+            now
+        ))
+
+        conn.commit()
+        conn.close()
+        print(f"✓ Saved to database: {DB_PATH}")
+
+    except Exception as e:
+        print(f"⚠️  Failed to save to database: {e}")
+
 
 # Import registration functions
 try:
@@ -179,7 +280,7 @@ def register_one_account(config, use_9router, headless):
                 if cached_device_code_data:
                     expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
                     remaining = max(0, int(expires_at_timestamp - time.time()))
-                    if remaining > 180:
+                    if remaining > 250:
                         print(f"ℹ️  Reusing cached device code (expires in {remaining}s)")
                     else:
                         print("⚠️  Cached device code expired, generating fresh one")
@@ -241,6 +342,10 @@ def register_one_account(config, use_9router, headless):
                 if use_9router:
                     export_status = 'Yes ✅' if exported else 'No ⚠️'
                     print(f"   Exported to 9router: {export_status}")
+
+                # Save to database
+                save_account(result)
+
                 return result
             else:
                 # No result or no email

@@ -147,7 +147,9 @@ class GsuiteImapProvider(MailProvider):
 
     def create_mailbox(self) -> str:
         domain = random.choice(self.domains)
-        local = f"{self.local_prefix}{_random_local(self.local_length)}"
+        timestamp = int(time.time())
+        random_suffix = _random_local(self.local_length)
+        local = f"{self.local_prefix}{timestamp}{random_suffix}"
         self.address = f"{local}@{domain}"
         self._created_at = time.time()
         self._seen_uids = set()
