@@ -15,119 +15,149 @@ import asyncio
 import json
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-from kiro_register import register, register_via_9router_oauth
-from mail_providers import get_provider
+# Import registration functions
+try:
+    from kiro_register import register, register_via_9router_oauth
+    from mail_providers import get_provider as get_mail_provider, list_providers
+except ImportError as e:
+    print(f"Import error: {e}")
+    print("Make sure you're running from the project root")
+    sys.exit(1)
 
 
 def load_config():
-    """Load kiro_config.json or exit."""
+    """Load configuration from kiro_config.json"""
     config_path = Path("kiro_config.json")
     if not config_path.exists():
-        print("❌ Error: kiro_config.json not found")
-        print("   Run the GUI first to generate config")
+        print("❌ kiro_config.json not found")
         sys.exit(1)
 
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def print_stats(mode, count, successful, failed, total):
-    """Print final statistics."""
+def get_mail_provider_instance(config):
+    """Initialize mail provider from config."""
+    provider_name = config.get("mail_provider", "shiromail")
+
+    # Get provider config
+    if provider_name == "shiromail":
+        provider_config = config.get("shiromail", {})
+    elif provider_name == "yydsmail":
+        provider_config = config.get("yydsmail", {})
+    elif provider_name == "gsuite_imap":
+        provider_config = config.get("gsuite_imap", {})
+    else:
+        print(f"❌ Unknown mail provider: {provider_name}")
+        return None
+
+    try:
+        return get_mail_provider(provider_name, **provider_config)
+    except Exception as e:
+        print(f"❌ Failed to initialize mail provider: {e}")
+        return None
+
+
+def register_one_account(config, use_9router, headless):
+    """Register a single account with retry logic (synced with main.py)."""
+    mail_provider = get_mail_provider_instance(config)
+    if not mail_provider:
+        print("❌ Failed to initialize mail provider")
+        return None
+
+    MAX_RETRY = 3
+    for attempt in range(1, MAX_RETRY + 1):
+        if attempt > 1:
+            print(f"  Retry attempt {attempt}/{MAX_RETRY}...")
+
+        try:
+            if use_9router:
+                # Transform flat config to nested structure
+                router9_config = {
+                    "base_url": config.get("router9_url"),
+                    "password": config.get("router9_password"),
+                    "auth_token": config.get("router9_auth_token"),
+                    "auth_token_expires_at": config.get("router9_auth_token_expires_at")
+                }
+
+                if not router9_config.get("base_url") or not router9_config.get("password"):
+                    print("❌ 9router config incomplete")
+                    return None
+
+                result = asyncio.run(register_via_9router_oauth(
+                    mail_provider_instance=mail_provider,
+                    router9_config=router9_config,
+                    headless=headless,
+                    proxy_url=config.get("proxy_url"),
+                    auto_login=True,
+                    skip_onboard=True,
+                    cancel_check=None
+                ))
+            else:
+                result = asyncio.run(register(
+                    mail_provider_instance=mail_provider,
+                    headless=headless,
+                    proxy_url=config.get("proxy_url"),
+                    auto_login=True,
+                    skip_onboard=True,
+                    cancel_check=None
+                ))
+
+            if result and result.get("email"):
+                # Check if incomplete (TES block, export failure, etc.)
+                is_incomplete = result.get("incomplete", False)
+                if is_incomplete:
+                    fail_reason = result.get("failReason", "Unknown")
+                    print(f"❌ Registration incomplete: {fail_reason}")
+
+                    if attempt < MAX_RETRY:
+                        # TES blocks need longer cooling (synced with main.py)
+                        is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
+                        retry_delay = (10 + (attempt * 20)) if is_tes_block else (5 + (attempt * 3))
+                        print(f"  Waiting {retry_delay}s before retry...")
+                        time.sleep(retry_delay)
+                    continue
+
+                # Success - account complete and healthy
+                email = result["email"]
+                exported = result.get("router9_exported", False)
+                print(f"✅ Success! Email: {email}")
+                if use_9router:
+                    print(f"   Exported: {'Yes' if exported else 'No'}")
+                return result
+            else:
+                # No result or no email
+                print(f"❌ Failed: No result returned")
+                if attempt < MAX_RETRY:
+                    print(f"  Waiting 5s before retry...")
+                    time.sleep(5)
+
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            if attempt < MAX_RETRY:
+                print(f"  Waiting 5s before retry...")
+                time.sleep(5)
+
+    # All retries exhausted
+    print(f"❌ Failed after {MAX_RETRY} attempts")
+    return None
+
+
+def print_stats(mode, target, successful, failed, total):
+    """Print statistics summary."""
     print("\n" + "=" * 70)
     print(f"  {mode} COMPLETE")
     print("=" * 70)
-    print(f"  Processed: {total}")
-    print(f"  Successful: {successful} ({successful/total*100:.1f}%)")
-    print(f"  Failed: {failed}")
+    if target:
+        print(f"  Target: {target}")
+    print(f"  Total: {total}")
+    print(f"  ✅ Success: {successful}")
+    print(f"  ❌ Failed: {failed}")
     print(f"  Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
-
-
-def register_one(config, use_9router, headless, num, total=None):
-    """Run single registration. Returns True if successful."""
-    ts = datetime.now().strftime('%H:%M:%S')
-    label = f"Account {num}/{total}" if total else f"Account #{num}"
-
-    print(f"\n[{ts}] {label}")
-    print("-" * 70)
-
-    try:
-        provider_name = config["mail_provider"]
-
-        # Map flat config keys to provider constructor parameters
-        if provider_name == "gsuite_imap":
-            # Gmail/IMAP provider expects: imap_server, imap_port, imap_user, imap_pass, domains_file
-            try:
-                imap_port_int = int(config.get("imap_port", 993))
-            except (ValueError, TypeError):
-                imap_port_int = 993
-
-            provider_config = {
-                "imap_server": config.get("imap_server", "imap.gmail.com"),
-                "imap_port": imap_port_int,
-                "imap_user": config.get("imap_user", ""),
-                "imap_pass": config.get("imap_pass", ""),
-                "domains_file": config.get("imap_domains_file", "domains.txt"),
-            }
-        else:
-            # For shiromail, yydsmail, etc., try to find nested config or use empty dict
-            provider_config = config.get(provider_name, {})
-
-        mail_provider = get_provider(provider_name, **provider_config)
-
-        if use_9router:
-            # Transform flat config to nested structure expected by registration function
-            router9_config = {
-                "base_url": config.get("router9_url"),
-                "password": config.get("router9_password"),
-                "auth_token": config.get("router9_auth_token"),
-                "auth_token_expires_at": config.get("router9_auth_token_expires_at")
-            }
-
-            if not router9_config.get("base_url") or not router9_config.get("password"):
-                print("❌ 9router config missing in kiro_config.json")
-                print("   Required: router9_url, router9_password")
-                return False
-
-            result = asyncio.run(register_via_9router_oauth(
-                mail_provider_instance=mail_provider,
-                router9_config=router9_config,
-                headless=headless,
-                proxy_url=config.get("proxy_url"),
-                auto_login=True,
-                skip_onboard=True,
-                cancel_check=None
-            ))
-        else:
-            result = asyncio.run(register(
-                mail_provider_instance=mail_provider,
-                headless=headless,
-                proxy_url=config.get("proxy_url"),
-                auto_login=True,
-                skip_onboard=True,
-                cancel_check=None
-            ))
-
-        if result and result.get("email"):
-            email = result["email"]
-            exported = result.get("router9_exported", False)
-            print(f"✅ Success! Email: {email}")
-            if use_9router:
-                print(f"   Exported: {'Yes' if exported else 'No'}")
-            return True
-        else:
-            error = result.get("error", "Unknown") if result else "No result"
-            print(f"❌ Failed: {error}")
-            return False
-
-    except KeyboardInterrupt:
-        raise
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        return False
 
 
 def run_batch(count, delay, use_9router, headless):
@@ -148,7 +178,11 @@ def run_batch(count, delay, use_9router, headless):
     failed = 0
 
     for i in range(1, count + 1):
-        if register_one(config, use_9router, headless, i, count):
+        print(f"\n[{i}/{count}] Starting registration...")
+
+        result = register_one_account(config, use_9router, headless)
+
+        if result:
             successful += 1
         else:
             failed += 1
@@ -161,17 +195,17 @@ def run_batch(count, delay, use_9router, headless):
 
 
 def run_service(delay, use_9router, headless):
-    """Service mode - register continuously until Ctrl+C."""
+    """Service mode - infinite loop until Ctrl+C."""
     config = load_config()
 
     print("\n" + "=" * 70)
-    print("  K.I.R.O SERVICE MODE (INFINITE)")
+    print("  K.I.R.O SERVICE MODE")
     print("=" * 70)
+    print(f"  Mode: Continuous (Ctrl+C to stop)")
     print(f"  Delay: {delay}s")
     print(f"  Flow: {'9router OAuth' if use_9router else 'Standard'}")
     print(f"  Browser: {'Headless' if headless else 'Headed'}")
     print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Stop: Press Ctrl+C")
     print("=" * 70)
 
     successful = 0
@@ -181,16 +215,21 @@ def run_service(delay, use_9router, headless):
     try:
         while True:
             total += 1
-            if register_one(config, use_9router, headless, total, None):
+            print(f"\n[Account #{total}] Starting registration...")
+
+            result = register_one_account(config, use_9router, headless)
+
+            if result:
                 successful += 1
             else:
                 failed += 1
 
             print(f"\n⏳ Waiting {delay}s...")
             time.sleep(delay)
+            print_stats("SERVICE", None, successful, failed, total)
 
     except KeyboardInterrupt:
-        print("\n\n🛑 Stopped by user (Ctrl+C)")
+        print("\n\n⚠️  Service mode stopped by user (Ctrl+C)")
         print_stats("SERVICE", None, successful, failed, total)
 
 
@@ -207,7 +246,6 @@ def run_batch_loop(count, account_delay, batch_delay, use_9router, headless):
     print(f"  Flow: {'9router OAuth' if use_9router else 'Standard'}")
     print(f"  Browser: {'Headless' if headless else 'Headed'}")
     print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Stop: Press Ctrl+C")
     print("=" * 70)
 
     batch_num = 0
@@ -221,46 +259,37 @@ def run_batch_loop(count, account_delay, batch_delay, use_9router, headless):
             batch_successful = 0
             batch_failed = 0
 
-            print(f"\n{'='*70}")
+            print(f"\n{'=' * 70}")
             print(f"  BATCH #{batch_num}")
-            print(f"{'='*70}")
+            print(f"{'=' * 70}")
 
             for i in range(1, count + 1):
                 total_accounts += 1
-                if register_one(config, use_9router, headless, i, count):
+                print(f"\n[Batch {batch_num}, Account {i}/{count}] Starting registration...")
+
+                result = register_one_account(config, use_9router, headless)
+
+                if result:
                     batch_successful += 1
                     total_successful += 1
                 else:
                     batch_failed += 1
                     total_failed += 1
 
-                # Wait between accounts (except after last account in batch)
                 if i < count:
-                    print(f"\n⏳ Waiting {account_delay}s...")
+                    print(f"\n⏳ Account delay {account_delay}s...")
                     time.sleep(account_delay)
 
-            # Batch complete
-            print(f"\n{'='*70}")
-            print(f"  BATCH #{batch_num} COMPLETE")
-            print(f"  Success: {batch_successful}/{count} | Failed: {batch_failed}/{count}")
-            print(f"  Total so far: {total_successful} success, {total_failed} failed")
-            print(f"{'='*70}")
+            print(f"\nBatch #{batch_num} complete: ✅ {batch_successful} | ❌ {batch_failed}")
+            print(f"Total so far: ✅ {total_successful} | ❌ {total_failed}")
 
-            # Wait before next batch
-            next_batch_time = (datetime.now() + timedelta(seconds=batch_delay)).strftime('%H:%M:%S')
-            print(f"\n⏳ Waiting {batch_delay}s until next batch (starting ~{next_batch_time})...")
+            print(f"\n⏳ Batch delay {batch_delay}s before next batch...")
             time.sleep(batch_delay)
 
     except KeyboardInterrupt:
-        print("\n\n🛑 Stopped by user (Ctrl+C)")
-        print(f"\n{'='*70}")
-        print(f"  BATCH LOOP SUMMARY")
-        print(f"{'='*70}")
-        print(f"  Batches completed: {batch_num}")
-        print(f"  Total accounts: {total_accounts}")
-        print(f"  Success: {total_successful} ({100*total_successful//total_accounts if total_accounts else 0}%)")
-        print(f"  Failed: {total_failed}")
-        print(f"{'='*70}")
+        print("\n\n⚠️  Batch loop mode stopped by user (Ctrl+C)")
+        print_stats("BATCH LOOP", None, total_successful, total_failed, total_accounts)
+        print(f"  Total batches: {batch_num}")
 
 
 def main():
@@ -269,66 +298,46 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python service.py --batch 10                              # 10 accounts then stop
-  python service.py --service                               # Infinite loop
-  python service.py --batch 50 --delay 30                   # 50 accounts, 30s delay
-  python service.py --batch-loop 10 --delay 300             # 10 accounts/batch, 5min delay, 1hr between batches (default)
-  python service.py --batch-loop 10 --delay 300 --batch-delay 7200  # Custom 2hr batch delay
-  python service.py --service --9router                     # Service with 9router OAuth
-  python service.py --batch 100 --headless                  # Headless browser
+  python service.py --batch 10
+  python service.py --service --delay 60
+  python service.py --batch-loop 5 --account-delay 10 --batch-delay 120
+  python service.py --batch 20 --9router --headed
         """
     )
 
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--batch", type=int, metavar="N",
-                     help="Batch mode: register N accounts then stop")
-    mode.add_argument("--batch-loop", type=int, metavar="N", dest="batch_loop",
-                     help="Batch loop mode: register N accounts per batch, repeat infinitely")
-    mode.add_argument("--service", action="store_true",
-                     help="Service mode: infinite loop until Ctrl+C")
+    # Mode selection
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--batch", type=int, metavar="N",
+                            help="Batch mode: register N accounts then stop")
+    mode_group.add_argument("--service", action="store_true",
+                            help="Service mode: infinite loop until Ctrl+C")
+    mode_group.add_argument("--batch-loop", type=int, metavar="N",
+                            help="Batch loop mode: register N accounts per batch, repeat infinitely")
 
-    parser.add_argument("--delay", type=int, default=10, metavar="SEC",
-                       help="Delay between registrations (default: 10s)")
-    parser.add_argument("--batch-delay", type=int, default=3600, metavar="SEC",
-                       help="Delay between batches in --batch-loop mode (default: 3600s=1hr)")
-    parser.add_argument("--9router", dest="use_9router", action="store_true",
-                       help="Use 9router OAuth flow")
-    parser.add_argument("--headless", action="store_true",
-                       help="Run browser in headless mode")
+    # Common options
+    parser.add_argument("--delay", type=int, default=10,
+                        help="Delay in seconds between accounts (default: 10)")
+    parser.add_argument("--account-delay", type=int, default=10,
+                        help="Delay between accounts in batch-loop mode (default: 10)")
+    parser.add_argument("--batch-delay", type=int, default=60,
+                        help="Delay between batches in batch-loop mode (default: 60)")
+    parser.add_argument("--9router", action="store_true",
+                        help="Use 9router OAuth flow instead of standard registration")
+    parser.add_argument("--headed", action="store_true",
+                        help="Run browser in headed mode (visible)")
 
     args = parser.parse_args()
 
-    if args.delay < 1:
-        print("❌ --delay must be at least 1 second")
-        sys.exit(1)
+    headless = not args.headed
+    use_9router = getattr(args, '9router')
 
-    if args.batch and args.batch < 1:
-        print("❌ --batch must be at least 1")
-        sys.exit(1)
-
-    if args.batch_loop and args.batch_loop < 1:
-        print("❌ --batch-loop must be at least 1")
-        sys.exit(1)
-
-    if args.batch_delay and args.batch_delay < 1:
-        print("❌ --batch-delay must be at least 1 second")
-        sys.exit(1)
-
-    try:
-        if args.batch:
-            run_batch(args.batch, args.delay, args.use_9router, args.headless)
-        elif args.batch_loop:
-            run_batch_loop(args.batch_loop, args.delay, args.batch_delay, args.use_9router, args.headless)
-        else:
-            run_service(args.delay, args.use_9router, args.headless)
-    except KeyboardInterrupt:
-        print("\n\n🛑 Interrupted")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    # Run the selected mode
+    if args.batch:
+        run_batch(args.batch, args.delay, use_9router, headless)
+    elif args.service:
+        run_service(args.delay, use_9router, headless)
+    elif args.batch_loop:
+        run_batch_loop(args.batch_loop, args.account_delay, args.batch_delay, use_9router, headless)
 
 
 if __name__ == "__main__":

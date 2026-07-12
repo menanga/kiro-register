@@ -7,7 +7,10 @@
       "mcp__plugin_ecc_github__search_code",
       "Bash(sqlite3 *)",
       "Bash(python3 *)",
-      "Bash(chmod +x *)"
+      "Bash(chmod +x *)",
+      "Bash(Get-ChildItem -Filter \"*.py\" -Recurse)",
+      "Bash(Select-String -Pattern \"from.*kiro_register|import.*kiro_register\")",
+      "Bash(Select-Object -ExpandProperty Path -Unique)"
     ],
     "allowed": [
       "python *",

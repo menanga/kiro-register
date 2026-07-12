@@ -1195,6 +1195,31 @@ class App(tk.Tk):
         ttk.Checkbutton(opts_frame, text="Fingerprint browser", variable=self._reg_use_roxy).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts_frame, text="Use 9router OAuth Flow", variable=self._use_9router_flow).pack(side="left", padx=(0, 12))
 
+        # Batch automation config
+        batch_frame = ttk.LabelFrame(tab, text="Batch Automation", padding=(8, 4))
+        batch_frame.pack(fill="x", pady=(0, 8))
+
+        batch_row1 = ttk.Frame(batch_frame)
+        batch_row1.pack(fill="x", pady=2)
+        ttk.Label(batch_row1, text="Batch count:", width=12).pack(side="left")
+        self._reg_batch_count = tk.StringVar(value="10")
+        ttk.Entry(batch_row1, textvariable=self._reg_batch_count, width=10).pack(side="left", padx=4)
+        ttk.Label(batch_row1, text="Account delay (s):", width=15).pack(side="left", padx=(12, 0))
+        self._reg_account_delay = tk.StringVar(value="10")
+        ttk.Entry(batch_row1, textvariable=self._reg_account_delay, width=10).pack(side="left", padx=4)
+        ttk.Label(batch_row1, text="Batch delay (s):", width=15).pack(side="left", padx=(12, 0))
+        self._reg_batch_delay = tk.StringVar(value="60")
+        ttk.Entry(batch_row1, textvariable=self._reg_batch_delay, width=10).pack(side="left", padx=4)
+
+        batch_btn_frame = ttk.Frame(batch_frame)
+        batch_btn_frame.pack(fill="x", pady=(4, 0))
+        self._reg_auto_btn = ttk.Button(batch_btn_frame, text="Auto Register (Batch)", style="Green.TButton",
+                                        command=self._reg_auto_batch)
+        self._reg_auto_btn.pack(side="left", padx=(0, 5))
+        self._reg_continuous_btn = ttk.Button(batch_btn_frame, text="Continuous Mode", style="Green.TButton",
+                                              command=self._reg_continuous)
+        self._reg_continuous_btn.pack(side="left", padx=(0, 5))
+
         btn_frame = ttk.Frame(opts_frame)
         btn_frame.pack(side="right")
         self._reg_start_btn = ttk.Button(btn_frame, text="Start registration", style="Green.TButton",
@@ -1722,9 +1747,27 @@ class App(tk.Tk):
                     # Account healthy
                     is_incomplete = result.get("incomplete", False)
                     if is_incomplete:
-                        self._reg_queue.put((f"[-] Registration incomplete ({result.get('failReason', '')}), skip-DB", "err"))
+                        fail_reason = result.get('failReason', '')
+                        self._reg_queue.put((f"[-] Registration incomplete ({fail_reason}), skip-DB", "err"))
+
                         if attempt < MAX_RETRY:
-                            self._reg_queue.put(("Will auto-register a replacement...", "warn"))
+                            # TES blocks need longer cooling time
+                            is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
+                            if is_tes_block:
+                                retry_delay = 15 + (attempt * 10)  # 15s, 25s, 35s
+                                self._reg_queue.put((f"AWS TES block detected. Waiting {retry_delay}s before retry {attempt + 1}/{MAX_RETRY}...", "warn"))
+                            else:
+                                retry_delay = 5 + (attempt * 3)  # 5s, 8s, 11s
+                                self._reg_queue.put((f"Waiting {retry_delay}s before retry {attempt + 1}/{MAX_RETRY}...", "warn"))
+
+                            # Sleep with cancel check
+                            for _ in range(retry_delay * 10):
+                                if self._reg_cancel:
+                                    break
+                                time.sleep(0.1)
+
+                            if not self._reg_cancel:
+                                self._reg_queue.put(("Will auto-register a replacement...", "warn"))
                         continue
                     self._reg_queue.put(("Registration complete! Account is healthy", "ok"))
                     _do_import_and_subscribe(result, loop)
@@ -1852,6 +1895,328 @@ class App(tk.Tk):
                 self.after(0, lambda: self._reg_start_btn.configure(state="normal"))
                 self.after(0, lambda: self._reg_pro_only_btn.configure(state="normal"))
                 self.after(0, lambda: self._reg_stop_btn.configure(state="disabled"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _reg_auto_batch(self):
+        """Auto register N accounts with delay between each."""
+        if self._reg_running:
+            return
+
+        try:
+            count = int(self._reg_batch_count.get())
+            delay = int(self._reg_account_delay.get())
+        except ValueError:
+            messagebox.showerror("Error", "Batch count and account delay must be integers")
+            return
+
+        if count <= 0:
+            messagebox.showerror("Error", "Batch count must be > 0")
+            return
+
+        self._reg_running = True
+        self._reg_cancel = False
+        self._reg_term.delete("1.0", "end")
+        self._reg_term.insert("end", f"[*] BATCH MODE: {count} accounts, {delay}s delay\n", "info")
+        self._reg_start_btn.configure(state="disabled")
+        self._reg_auto_btn.configure(state="disabled")
+        self._reg_continuous_btn.configure(state="disabled")
+        self._reg_pro_only_btn.configure(state="disabled")
+        self._reg_stop_btn.configure(state="normal")
+        self.after(100, self._reg_poll_queue)
+
+        def _worker():
+            successful = 0
+            failed = 0
+
+            for i in range(1, count + 1):
+                if self._reg_cancel:
+                    self._reg_queue.put((f"Stopped by user at {i-1}/{count}", "warn"))
+                    break
+
+                self._reg_queue.put((f"\n[{i}/{count}] Starting registration...", "info"))
+
+                # Retry loop per account
+                MAX_RETRY = 3
+                account_success = False
+
+                for attempt in range(1, MAX_RETRY + 1):
+                    if self._reg_cancel:
+                        break
+
+                    if attempt > 1:
+                        self._reg_queue.put((f"  Retry attempt {attempt}/{MAX_RETRY}...", "info"))
+
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+
+                        # Get registration options
+                        headless = self._reg_headless.get()
+                        auto_login = self._reg_auto_login.get()
+                        skip_onboard = self._reg_skip_onboard.get()
+                        use_roxy = self._reg_use_roxy.get()
+
+                        result = loop.run_until_complete(
+                            self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy)
+                        )
+
+                        if result and result.get("email"):
+                            # Check if incomplete (TES block, export failure, etc.)
+                            is_incomplete = result.get("incomplete", False)
+                            if is_incomplete:
+                                fail_reason = result.get("failReason", "Unknown")
+                                self._reg_queue.put((f"❌ Registration incomplete: {fail_reason}", "err"))
+
+                                if attempt < MAX_RETRY:
+                                    # TES blocks need longer cooling
+                                    is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
+                                    retry_delay = (15 + (attempt * 10)) if is_tes_block else (5 + (attempt * 3))
+                                    self._reg_queue.put((f"  Waiting {retry_delay}s before retry...", "warn"))
+
+                                    for _ in range(retry_delay * 10):
+                                        if self._reg_cancel:
+                                            break
+                                        time.sleep(0.1)
+                                continue
+
+                            # Complete and healthy - import to DB
+                            successful += 1
+                            account_success = True
+                            self._reg_queue.put((f"✅ Success! Email: {result['email']}", "ok"))
+
+                            # Import to database and subscribe if enabled
+                            try:
+                                self._reg_import_to_db(result)
+                                self._reg_queue.put(("  Imported to database", "ok"))
+
+                                # Auto-subscribe to Pro if enabled
+                                if self._reg_pro_trial.get():
+                                    self._reg_queue.put(("  Starting Pro trial subscription...", "info"))
+                                    loop.run_until_complete(self._reg_pro_trial_subscribe(result, loop))
+                            except Exception as e:
+                                self._reg_queue.put((f"  DB import/subscribe error: {e}", "warn"))
+
+                            break
+                        else:
+                            # Other failure
+                            error = result.get("error", "Unknown") if result else "No result"
+                            self._reg_queue.put((f"❌ Failed: {error}", "err"))
+                            if attempt < MAX_RETRY:
+                                self._reg_queue.put((f"  Waiting 5s before retry...", "warn"))
+                                for _ in range(50):
+                                    if self._reg_cancel:
+                                        break
+                                    time.sleep(0.1)
+                            continue
+
+                    except Exception as e:
+                        self._reg_queue.put((f"❌ Error: {e}", "err"))
+                        if attempt < MAX_RETRY:
+                            self._reg_queue.put((f"  Waiting 5s before retry...", "warn"))
+                            for _ in range(50):
+                                if self._reg_cancel:
+                                    break
+                                time.sleep(0.1)
+
+                if not account_success:
+                    failed += 1
+
+                if i < count and not self._reg_cancel:
+                    self._reg_queue.put((f"⏳ Waiting {delay}s...", "info"))
+                    for _ in range(delay * 10):
+                        if self._reg_cancel:
+                            break
+                        time.sleep(0.1)
+
+            self._reg_queue.put((f"\n{'='*50}", "info"))
+            self._reg_queue.put((f"BATCH COMPLETE", "info"))
+            self._reg_queue.put((f"  Total: {count}", "info"))
+            self._reg_queue.put((f"  Success: {successful}", "ok"))
+            self._reg_queue.put((f"  Failed: {failed}", "err"))
+            self._reg_queue.put((f"{'='*50}", "info"))
+
+            self._reg_running = False
+            self.after(0, lambda: self._reg_start_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_auto_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_continuous_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_pro_only_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_stop_btn.configure(state="disabled"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _reg_continuous(self):
+        """Continuous registration mode - infinite loop with batch delays."""
+        if self._reg_running:
+            return
+
+        try:
+            batch_count = int(self._reg_batch_count.get())
+            account_delay = int(self._reg_account_delay.get())
+            batch_delay = int(self._reg_batch_delay.get())
+        except ValueError:
+            messagebox.showerror("Error", "All delay values must be integers")
+            return
+
+        if batch_count <= 0:
+            messagebox.showerror("Error", "Batch count must be > 0")
+            return
+
+        self._reg_running = True
+        self._reg_cancel = False
+        self._reg_term.delete("1.0", "end")
+        self._reg_term.insert("end", f"[*] CONTINUOUS MODE\n", "info")
+        self._reg_term.insert("end", f"    Batch: {batch_count} accounts\n", "info")
+        self._reg_term.insert("end", f"    Account delay: {account_delay}s\n", "info")
+        self._reg_term.insert("end", f"    Batch delay: {batch_delay}s\n", "info")
+        self._reg_term.insert("end", f"    Stop: Press 'Stop' button\n", "info")
+        self._reg_start_btn.configure(state="disabled")
+        self._reg_auto_btn.configure(state="disabled")
+        self._reg_continuous_btn.configure(state="disabled")
+        self._reg_pro_only_btn.configure(state="disabled")
+        self._reg_stop_btn.configure(state="normal")
+        self.after(100, self._reg_poll_queue)
+
+        def _worker():
+            batch_num = 0
+            total_successful = 0
+            total_failed = 0
+
+            while not self._reg_cancel:
+                batch_num += 1
+                batch_successful = 0
+                batch_failed = 0
+
+                self._reg_queue.put((f"\n{'='*50}", "info"))
+                self._reg_queue.put((f"BATCH #{batch_num}", "info"))
+                self._reg_queue.put((f"{'='*50}", "info"))
+
+                for i in range(1, batch_count + 1):
+                    if self._reg_cancel:
+                        break
+
+                    self._reg_queue.put((f"\n[Batch {batch_num}, Account {i}/{batch_count}]", "info"))
+
+                    # Retry loop per account
+                    MAX_RETRY = 3
+                    account_success = False
+
+                    for attempt in range(1, MAX_RETRY + 1):
+                        if self._reg_cancel:
+                            break
+
+                        if attempt > 1:
+                            self._reg_queue.put((f"  Retry attempt {attempt}/{MAX_RETRY}...", "info"))
+
+                        try:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+
+                            # Get registration options
+                            headless = self._reg_headless.get()
+                            auto_login = self._reg_auto_login.get()
+                            skip_onboard = self._reg_skip_onboard.get()
+                            use_roxy = self._reg_use_roxy.get()
+
+                            result = loop.run_until_complete(
+                                self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy)
+                            )
+
+                            if result and result.get("email"):
+                                # Check if incomplete (TES block, export failure, etc.)
+                                is_incomplete = result.get("incomplete", False)
+                                if is_incomplete:
+                                    fail_reason = result.get("failReason", "Unknown")
+                                    self._reg_queue.put((f"❌ Registration incomplete: {fail_reason}", "err"))
+
+                                    if attempt < MAX_RETRY:
+                                        # TES blocks need longer cooling
+                                        is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
+                                        retry_delay = (15 + (attempt * 10)) if is_tes_block else (5 + (attempt * 3))
+                                        self._reg_queue.put((f"  Waiting {retry_delay}s before retry...", "warn"))
+
+                                        for _ in range(retry_delay * 10):
+                                            if self._reg_cancel:
+                                                break
+                                            time.sleep(0.1)
+                                    continue
+
+                                # Complete and healthy - import to DB
+                                batch_successful += 1
+                                total_successful += 1
+                                account_success = True
+                                self._reg_queue.put((f"✅ Success! Email: {result['email']}", "ok"))
+
+                                # Import to database and subscribe if enabled
+                                try:
+                                    self._reg_import_to_db(result)
+                                    self._reg_queue.put(("  Imported to database", "ok"))
+
+                                    # Auto-subscribe to Pro if enabled
+                                    if self._reg_pro_trial.get():
+                                        self._reg_queue.put(("  Starting Pro trial subscription...", "info"))
+                                        loop.run_until_complete(self._reg_pro_trial_subscribe(result, loop))
+                                except Exception as e:
+                                    self._reg_queue.put((f"  DB import/subscribe error: {e}", "warn"))
+
+                                break
+                            else:
+                                # Other failure
+                                error = result.get("error", "Unknown") if result else "No result"
+                                self._reg_queue.put((f"❌ Failed: {error}", "err"))
+                                if attempt < MAX_RETRY:
+                                    self._reg_queue.put((f"  Waiting 5s before retry...", "warn"))
+                                    for _ in range(50):
+                                        if self._reg_cancel:
+                                            break
+                                        time.sleep(0.1)
+                                continue
+
+                        except Exception as e:
+                            self._reg_queue.put((f"❌ Error: {e}", "err"))
+                            if attempt < MAX_RETRY:
+                                self._reg_queue.put((f"  Waiting 5s before retry...", "warn"))
+                                for _ in range(50):
+                                    if self._reg_cancel:
+                                        break
+                                    time.sleep(0.1)
+
+                    if not account_success:
+                        batch_failed += 1
+                        total_failed += 1
+
+                    if i < batch_count and not self._reg_cancel:
+                        self._reg_queue.put((f"⏳ Account delay {account_delay}s...", "info"))
+                        for _ in range(account_delay * 10):
+                            if self._reg_cancel:
+                                break
+                            time.sleep(0.1)
+
+                self._reg_queue.put((f"\nBatch #{batch_num} complete: ✅ {batch_successful} | ❌ {batch_failed}", "info"))
+                self._reg_queue.put((f"Total so far: ✅ {total_successful} | ❌ {total_failed}", "info"))
+
+                if self._reg_cancel:
+                    break
+
+                self._reg_queue.put((f"\n⏳ Batch delay {batch_delay}s before next batch...", "info"))
+                for _ in range(batch_delay * 10):
+                    if self._reg_cancel:
+                        break
+                    time.sleep(0.1)
+
+            self._reg_queue.put((f"\n{'='*50}", "info"))
+            self._reg_queue.put((f"CONTINUOUS MODE STOPPED", "warn"))
+            self._reg_queue.put((f"  Total batches: {batch_num}", "info"))
+            self._reg_queue.put((f"  Total success: {total_successful}", "ok"))
+            self._reg_queue.put((f"  Total failed: {total_failed}", "err"))
+            self._reg_queue.put((f"{'='*50}", "info"))
+
+            self._reg_running = False
+            self.after(0, lambda: self._reg_start_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_auto_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_continuous_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_pro_only_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_stop_btn.configure(state="disabled"))
 
         threading.Thread(target=_worker, daemon=True).start()
 

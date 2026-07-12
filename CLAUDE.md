@@ -36,9 +36,25 @@ python -m playwright install chromium
 ```bash
 # Launch the GUI
 python main.py
+
+# Headless batch mode (CLI)
+python service.py --batch 10 --delay 10 --9router
+
+# Continuous service mode (CLI)
+python service.py --service --delay 60 --9router
+
+# Batch loop mode (CLI)
+python service.py --batch-loop 5 --account-delay 10 --batch-delay 120 --9router
 ```
 
 On first launch, the app generates `kiro_config.json` with mail provider settings, captcha API keys, and CDK codes.
+
+**GUI Batch Automation:**
+- Registration tab includes batch automation section
+- Configure batch count, account delay, batch delay
+- "Auto Register (Batch)" button: runs N accounts with retry
+- "Continuous Mode" button: infinite batch loop until stopped
+- Both modes use same retry logic as CLI service.py
 
 ## Development Commands
 
@@ -117,7 +133,20 @@ mail_providers/         # Pluggable temp-mail backends
 4. Handle hCaptcha (automated via YesCaptcha/Multibot or manual fallback)
 5. Submit email and poll for OTP code
 6. Complete registration and extract OAuth tokens
-7. Encrypt and store tokens in SQLite
+7. Export to 9router (if using 9router OAuth flow)
+8. Encrypt and store tokens in SQLite
+
+**Success Criteria:** Registration only succeeds when:
+- All steps complete without errors
+- 9router export succeeds (when using `--9router` flag)
+- Account is authorized/activated for Kiro AI
+- Returns `incomplete=False` in result dict
+
+**Retry Logic:**
+- 3 retry attempts per account
+- TES blocks: 10s, 30s, 60s delays (exponential backoff)
+- Other failures: 5s, 8s, 11s delays
+- Only complete accounts saved to database
 
 ### 2. Mail Provider Plugin System
 
@@ -231,11 +260,20 @@ AWS Trust Evaluation Service (TES) blocks show up as:
 - `create-identity` API returns `400` with `errorCode=BLOCKED`
 - Symptoms: registration hangs after email submission, OTP never validates
 
-**Solutions**:
-1. Configure a residential proxy in Settings tab
-2. Disable headless mode (TES profiles headless Chrome)
-3. Use self-hosted IMAP with owned domains (not temp-mail services)
-4. Slow down concurrent registrations (TES tracks velocity)
+**Solutions implemented:**
+1. **Automatic retry with longer delays**: 10s, 30s, 60s (not 2s/4s/8s)
+2. **Only mark success when export completes**: Incomplete registrations trigger retry
+3. **Configure residential proxy** in Settings tab or kiro_config.json
+4. **Disable headless mode** (TES profiles headless Chrome)
+5. **Use self-hosted IMAP** with owned domains (not temp-mail services)
+6. **Slow down concurrent registrations** (TES tracks velocity)
+
+**Batch automation retry behavior:**
+- GUI: Registration tab → "Auto Register (Batch)" or "Continuous Mode"
+- CLI: `python service.py --batch 10` or `--service` or `--batch-loop 5`
+- Both GUI and CLI use same retry logic with TES-specific delays
+- Failed accounts (TES blocks, incomplete exports) properly counted as failures
+- Only successful, complete accounts saved to database
 
 ### Database Schema
 

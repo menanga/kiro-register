@@ -768,6 +768,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                 device_scale_factor=fp_config["pixel_ratio"],
             )
             page = await context.new_page()
+            page.set_default_timeout(90000)  # 90s timeout for all operations
             await Stealth().apply_stealth_async(page)
 
             # Track the latest create-identity outcome so the OTP retry loop can
@@ -1786,7 +1787,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     log(f"Name filled: {full_name}", "ok")
 
                     # Click Continue button with TES block detection and retry
-                    max_send_otp_retries = 3
+                    max_send_otp_retries = 4  # 4 attempts = initial + 3 retries (10s, 30s, 60s)
                     send_otp_success = False
 
                     for send_otp_attempt in range(max_send_otp_retries):
@@ -1846,7 +1847,8 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
                             if body.get('errorCode') == 'BLOCKED':
                                 if send_otp_attempt < max_send_otp_retries - 1:
-                                    wait_time = 2 ** (send_otp_attempt + 1)  # 2s, 4s, 8s
+                                    wait_times = [10, 30, 60]  # 10s, 30s, 60s
+                                    wait_time = wait_times[send_otp_attempt] if send_otp_attempt < len(wait_times) else 60
                                     log(f"TES blocked registration, retrying in {wait_time}s (attempt {send_otp_attempt + 2}/{max_send_otp_retries})...", "warn")
                                     await asyncio.sleep(wait_time)
                                     continue  # Retry Continue button click
@@ -2192,6 +2194,9 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
         log("✅ Exported to 9router!", "ok")
     else:
         log(f"⚠️  Export failed: {poll.get('error', 'unknown')}", "warn")
+        # Export failed = incomplete registration
+        await browser.close()
+        return _partial("9router export failed")
 
     # Phase 4: Local tokens
     if auto_login:
