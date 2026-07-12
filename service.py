@@ -145,20 +145,19 @@ def get_mail_provider_instance(config):
 
 
 def register_one_account(config, use_9router, headless):
-    """Register a single account with retry logic (synced with main.py)."""
+    """Register a single account with retry logic (fresh email, reuse device_code)."""
     mail_provider = get_mail_provider_instance(config)
     if not mail_provider:
         print("❌ Failed to initialize mail provider")
         return None
 
-    # Cache for retry persistence
-    cached_email = None
+    # Cache device_code only (not email)
     cached_device_code_data = None
 
     MAX_RETRY = 3
     for attempt in range(1, MAX_RETRY + 1):
         print(f"\n{'='*60}")
-        print(f"🔄 Registration attempt {attempt}/{MAX_RETRY}")
+        print(f"🔄 Registration attempt {attempt}/{MAX_RETRY} (fresh email)")
         print(f"{'='*60}")
 
         try:
@@ -177,12 +176,14 @@ def register_one_account(config, use_9router, headless):
                     return None
 
                 print("ℹ️  Using 9router OAuth device code flow...")
-                if cached_email:
-                    print(f"ℹ️  Reusing cached email: {cached_email}")
                 if cached_device_code_data:
                     expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
                     remaining = max(0, int(expires_at_timestamp - time.time()))
-                    print(f"ℹ️  Reusing cached device code (expires in {remaining}s)")
+                    if remaining > 180:
+                        print(f"ℹ️  Reusing cached device code (expires in {remaining}s)")
+                    else:
+                        print("⚠️  Cached device code expired, generating fresh one")
+                        cached_device_code_data = None
 
                 result = asyncio.run(register_via_9router_oauth(
                     mail_provider_instance=mail_provider,
@@ -192,7 +193,7 @@ def register_one_account(config, use_9router, headless):
                     auto_login=True,
                     skip_onboard=True,
                     cancel_check=None,
-                    cached_email=cached_email,
+                    cached_email=None,  # Always fresh
                     cached_device_code_data=cached_device_code_data
                 ))
             else:
@@ -207,23 +208,8 @@ def register_one_account(config, use_9router, headless):
                 ))
 
             if result and result.get("email"):
-                # Cache email AND device code for next retry
-                cached_email = result.get("email")
+                # Cache device_code for next retry (but not email)
                 cached_device_code_data = result.get("device_code_info")
-
-                if cached_email:
-                    print(f"ℹ️  Email cached: {cached_email}")
-
-                if cached_device_code_data:
-                    expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
-                    remaining = max(0, int(expires_at_timestamp - time.time()))
-                    print(f"ℹ️  Device code cached (expires in {remaining}s)")
-
-                    # Check if expired - clear cache if so
-                    if remaining <= 0:
-                        print(f"⚠️  Device code expired, will generate fresh email + device code on next retry")
-                        cached_email = None
-                        cached_device_code_data = None
 
                 # Check if incomplete (TES block, export failure, etc.)
                 is_incomplete = result.get("incomplete", False)
@@ -237,12 +223,13 @@ def register_one_account(config, use_9router, headless):
 
                     if "device code" in fail_reason.lower() and "expired" in fail_reason.lower():
                         print("⚠️  9router device code expired - re-authentication needed")
+                        cached_device_code_data = None  # Clear expired device code
 
                     if attempt < MAX_RETRY:
                         # TES blocks need longer cooling (synced with main.py)
                         is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
                         retry_delay = (10 + (attempt * 20)) if is_tes_block else (5 + (attempt * 3))
-                        print(f"⏳ Waiting {retry_delay}s before retry (reason: {'TES cooldown' if is_tes_block else 'standard backoff'})...")
+                        print(f"⏳ Waiting {retry_delay}s before retry with fresh email (reason: {'TES cooldown' if is_tes_block else 'standard backoff'})...")
                         time.sleep(retry_delay)
                     continue
 
