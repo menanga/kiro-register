@@ -298,7 +298,7 @@ def inject_machine_ids(log=print):
     """Inject randomised machine identifiers into Kiro's storage.json."""
     storage_path = Path(os.environ.get("APPDATA", "")) / "Kiro" / "User" / "globalStorage" / "storage.json"
     if not storage_path.exists():
-        log("storage.json not found; skipping machine-id injection", "warn")
+        log(f"storage.json not found at {storage_path}; skipping machine-id injection", "warn")
         return None
 
     ids = _random_machine_ids()
@@ -307,10 +307,10 @@ def inject_machine_ids(log=print):
         for key, value in ids.items():
             storage[key] = value
         storage_path.write_text(json.dumps(storage, indent=4), encoding="utf-8")
-        log(f"Machine IDs injected: machineId={ids['telemetry.machineId'][:16]}...", "ok")
+        log(f"Machine IDs injected into storage.json: machineId={ids['telemetry.machineId'][:16]}..., devDeviceId={ids['telemetry.devDeviceId'][:16]}...", "ok")
         return ids
     except Exception as e:
-        log(f"Machine-id injection failed: {e}", "error")
+        log(f"Machine-id injection failed during storage.json write: {e}", "err")
         return None
 
 
@@ -423,7 +423,7 @@ def persist_tokens(client_id, client_secret, access_token, refresh_token, expire
         os.chmod(token_path, stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
-    log("Token written locally", "ok")
+    log(f"OAuth token written to {token_path}", "ok")
     client_data = {
         "clientId": client_id,
         "clientSecret": client_secret,
@@ -435,7 +435,7 @@ def persist_tokens(client_id, client_secret, access_token, refresh_token, expire
         os.chmod(client_path, stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
-    log("Client credentials saved", "ok")
+    log(f"OIDC client credentials saved to {client_path}", "ok")
 
 
 def skip_onboarding(log=print):
@@ -446,10 +446,10 @@ def skip_onboarding(log=print):
         storage = json.loads(storage_path.read_text(encoding="utf-8"))
         storage["kiroAgent.onboarding.onboardingCompleted"] = "true"
         storage_path.write_text(json.dumps(storage, indent=2), encoding="utf-8")
-        log("Onboarding skipped", "ok")
+        log(f"Onboarding flag set in storage.json: onboardingCompleted=true", "ok")
         return True
     except Exception as e:
-        log(f"Failed to skip onboarding: {e}", "err")
+        log(f"Failed to update onboarding flag in storage.json: {e}", "err")
         return False
 
 
@@ -554,13 +554,13 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
 
     # Build a random fingerprint config.
     fp_config = _random_fingerprint_config()
-    log(f"Browser fingerprint: Chrome/{fp_config['user_agent'].split('Chrome/')[1].split(' ')[0]}, "
-        f"{fp_config['viewport']['width']}x{fp_config['viewport']['height']}, "
-        f"{fp_config['timezone']}", "dbg")
+    log(f"Generated browser fingerprint: Chrome/{fp_config['user_agent'].split('Chrome/')[1].split(' ')[0]}, "
+        f"viewport={fp_config['viewport']['width']}x{fp_config['viewport']['height']}, "
+        f"timezone={fp_config['timezone']}", "dbg")
 
     pw_proxy = _parse_proxy_url(proxy_url)
     if pw_proxy:
-        log(f"Proxy enabled: {pw_proxy['server']}", "ok")
+        log(f"Residential proxy configured: {pw_proxy['server']}", "info")
 
     if proxy_url:
         s = curl_requests.Session(
@@ -576,9 +576,9 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     email = mail.create_mailbox()
     password = _generate_password()
     full_name = _generate_name()
-    log(f"Email: {email}", "ok")
-    log(f"Password: {password[:4]}****")
-    log(f"Name: {full_name}")
+    log(f"Generated credentials - Email: {email}", "info")
+    log(f"Generated credentials - Password: {password[:4]}****", "dbg")
+    log(f"Generated credentials - Name: {full_name}", "dbg")
 
     def _partial_result(reason="unknown"):
         """Return a partial record when registration fails mid-way so callers can still persist it."""
@@ -596,7 +596,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
         }
 
     # Phase 1: OIDC client registration
-    log("Phase 1: OIDC client registration")
+    log("Phase 1: Starting OIDC client registration with AWS", "info")
     code_verifier = secrets.token_urlsafe(64)
     code_challenge = _b64url(hashlib.sha256(code_verifier.encode()).digest())
     state_val = secrets.token_urlsafe(32)
@@ -609,11 +609,11 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     }, timeout=25, verify=False)
     reg = reg_resp.json()
     if "clientId" not in reg:
-        log(f"OIDC registration failed: {reg}", "err")
+        log(f"OIDC client registration failed - response: {reg}", "err")
         return _partial_result("OIDC registration failed")
     client_id = reg["clientId"]
     client_secret = reg["clientSecret"]
-    log("OIDC client registered", "ok")
+    log(f"OIDC client registered successfully - clientId: {client_id[:16]}...", "ok")
 
     signin_url = f"{KIRO_SIGNIN_URL}?" + urlencode({
         "state": state_val,
@@ -624,7 +624,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     })
 
     # Phase 2: local callback server + Playwright
-    log(f"Phase 2: launching browser (headless={headless})")
+    log(f"Phase 2: Launching Playwright browser for registration flow (headless={headless})", "info")
     authorization_code = ""
 
     class CallbackHandler(BaseHTTPRequestHandler):
@@ -637,14 +637,14 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
             code = qs.get("code", [""])[0]
             if code:
                 authorization_code = code
-                log("Authorization callback received", "ok")
+                log(f"OAuth authorization code received from callback server", "ok")
                 self_h.send_response(200)
                 self_h.send_header("Content-Type", "text/html")
                 self_h.end_headers()
                 self_h.wfile.write(b"<html><body><h2>Registration complete!</h2></body></html>")
             elif "signin/callback" in parsed.path or qs.get("login_option"):
                 CallbackHandler.signin_callback_params = {k: v[0] for k, v in qs.items()}
-                log("Sign-in callback received", "ok")
+                log(f"AWS signin callback received from redirect chain", "ok")
                 self_h.send_response(200)
                 self_h.send_header("Content-Type", "text/html")
                 self_h.end_headers()
@@ -908,7 +908,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
             await asyncio.sleep(2)
 
             if "profile.aws" not in page.url:
-                log(f"Failed to reach registration page (current: {page.url})", "err")
+                log(f"Failed to reach profile.aws registration page after navigation (current URL: {page.url})", "err")
                 await browser.close()
                 callback_server.shutdown()
                 return _partial_result("did not reach registration page")
@@ -1176,7 +1176,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                     callback_server.shutdown()
                     return _partial_result("OTP timeout")
 
-                log(f"OTP received: {otp_code}", "ok")
+                log(f"OTP code received from mail provider: {otp_code}", "info")
                 # Simulate a human switching back from the mail client by nudging the mouse first.
                 await _human_delay(2, 4)
                 try:
@@ -1445,7 +1445,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     }, timeout=25, verify=False)
 
     if token_resp.status_code != 200:
-        log(f"Token exchange failed: HTTP {token_resp.status_code}", "err")
+        log(f"OAuth token exchange failed with HTTP {token_resp.status_code} from {REG_OIDC}/token", "err")
         return _partial_result("token exchange failed")
 
     tokens = token_resp.json()
@@ -1454,24 +1454,24 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     expires_in = tokens.get("expiresIn", 28800)
 
     if not access_token:
-        log("Token exchange did not return an accessToken", "err")
+        log("Token exchange returned empty accessToken in response", "err")
         return _partial_result("missing accessToken")
 
-    log("Tokens obtained", "ok")
+    log(f"OAuth tokens obtained successfully (accessToken expires in {expires_in}s)", "ok")
 
     # Inject local tokens + random machine IDs.
     if auto_login:
-        log("Injecting local tokens...", "info")
+        log("Injecting OAuth tokens and machine IDs into local Kiro storage", "info")
         persist_tokens(client_id, client_secret, access_token, refresh_token, expires_in, log, email=email)
         machine_ids = inject_machine_ids(log)
         if skip_onboard:
             skip_onboarding(log)
 
-    log("=" * 40, "ok")
-    log("Registration complete!", "ok")
-    log(f"  Email: {email}", "ok")
-    log(f"  Password: {password}", "ok")
-    log("=" * 40, "ok")
+    log("=" * 40, "info")
+    log("AWS Builder ID registration completed successfully!", "ok")
+    log(f"  Account Email: {email}", "info")
+    log(f"  Account Password: {password}", "info")
+    log("=" * 40, "info")
 
     return {
         "email": email,
@@ -1526,20 +1526,20 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
         return None
 
     if not router9_config:
-        log("router9_config required for OAuth flow", "error")
+        log("router9_config required for 9router OAuth device code registration flow", "err")
         return None
 
     # Setup
     fp_config = _random_fingerprint_config()
-    log(f"Fingerprint: Chrome/{fp_config['user_agent'].split('Chrome/')[1].split(' ')[0]}, "
-        f"{fp_config['viewport']['width']}x{fp_config['viewport']['height']}", "dbg")
+    log(f"Generated browser fingerprint for 9router flow: Chrome/{fp_config['user_agent'].split('Chrome/')[1].split(' ')[0]}, "
+        f"viewport={fp_config['viewport']['width']}x{fp_config['viewport']['height']}", "dbg")
 
     pw_proxy = _parse_proxy_url(proxy_url)
     if pw_proxy:
         log(f"Proxy: {pw_proxy['server']}", "ok")
 
     if not mail_provider_instance:
-        log("mail_provider_instance required", "error")
+        log("mail_provider_instance required for 9router OAuth registration flow", "err")
         return None
 
     mail = mail_provider_instance
@@ -1583,11 +1583,11 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
     code_verifier = dev["codeVerifier"]
     region = dev.get("_region", "us-east-1")
 
-    log(f"User code: {dev.get('user_code', 'N/A')}", "ok")
-    log(f"URL: {verify_url[:60]}...", "info")
+    log(f"Device code obtained - User code: {dev.get('user_code', 'N/A')}", "info")
+    log(f"Device code obtained - Verification URL: {verify_url[:60]}...", "dbg")
 
     # Phase 2: Browser automation
-    log(f"Phase 2: browser (headless={headless})")
+    log(f"Phase 2: Launching browser for device code authorization (headless={headless})", "info")
 
     async with async_playwright() as p:
         args = [
@@ -1679,13 +1679,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                 continue_btn, btn_sel = button_result if isinstance(button_result, tuple) else (None, None)
 
                 if email_input:
-                    log(f"Found email input with selector: {email_sel}", "ok")
+                    log(f"Email input field located with selector: {email_sel}", "dbg")
                 if continue_btn:
-                    log(f"Found Continue button with selector: {btn_sel}", "ok")
+                    log(f"Continue button located with selector: {btn_sel}", "dbg")
 
                 if not email_input:
-                    log("Could not find email input field after trying multiple selectors", "error")
-                    log(f"Page HTML sample: {(await page.content())[:500]}", "dbg")
+                    log("Email input field not found after trying all known selectors on registration page", "err")
+                    log(f"Page HTML sample for debugging: {(await page.content())[:500]}", "dbg")
                     await browser.close()
                     return _partial("email input not found")
 
@@ -1761,7 +1761,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                 page.remove_listener("response", handle_email_response)
 
                 # Check if we're on the name input page
-                log("Checking for name input page...", "info")
+                log("Navigating to name input page after email submission", "info")
                 name_input = None
                 for selector in [
                     '[data-testid="signup-full-name-input"] input',
@@ -1772,7 +1772,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                         loc = page.locator(selector)
                         await loc.first.wait_for(state="visible", timeout=5000)
                         name_input = loc.first
-                        log(f"Found name input with selector: {selector}", "ok")
+                        log(f"Name input field located with selector: {selector}", "dbg")
                         break
                     except:
                         continue
@@ -1849,11 +1849,11 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                                 if send_otp_attempt < max_send_otp_retries - 1:
                                     wait_times = [10, 30, 60]  # 10s, 30s, 60s
                                     wait_time = wait_times[send_otp_attempt] if send_otp_attempt < len(wait_times) else 60
-                                    log(f"TES blocked registration, retrying in {wait_time}s (attempt {send_otp_attempt + 2}/{max_send_otp_retries})...", "warn")
+                                    log(f"AWS TES blocked send-otp, retrying in {wait_time}s (attempt {send_otp_attempt + 2}/{max_send_otp_retries})", "warn")
                                     await asyncio.sleep(wait_time)
                                     continue  # Retry Continue button click
                                 else:
-                                    log("TES blocked registration after max retries", "error")
+                                    log(f"AWS TES blocked registration after {max_send_otp_retries} retry attempts", "err")
                                     await browser.close()
                                     return _partial("Blocked by AWS TES")
                             else:
@@ -1870,7 +1870,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                             break
 
                     if not send_otp_success:
-                        log("Failed to proceed past name page", "error")
+                        log("Failed to navigate past name input page after form submission", "err")
                         await browser.close()
                         return _partial("Name page navigation failed")
                 else:
@@ -1898,7 +1898,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     continue
 
             if not otp_input:
-                log("Could not find OTP input field", "error")
+                log("OTP input field not found on verification page after trying all known selectors", "err")
                 await browser.close()
                 return _partial("OTP input not found")
 
@@ -1934,7 +1934,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                         if await btn.count() > 0:
                             await btn.first.click()
                             resend_clicked = True
-                            log("Clicked Resend OTP button", "ok")
+                            log("Resend OTP button clicked, waiting for new code", "info")
                             await asyncio.sleep(3)
                             break
                     except:
@@ -1942,7 +1942,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
                 if resend_clicked:
                     # Retry waiting for OTP (60s second attempt)
-                    log("Waiting for OTP after resend...", "info")
+                    log("Waiting for OTP code to arrive after resend request (60s timeout)", "info")
                     otp_deadline = time.time() + 60
                     while time.time() < otp_deadline:
                         if cancel_check and cancel_check():
@@ -1957,11 +1957,11 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                             pass
 
                 if not otp_code:
-                    log("OTP not received even after resend attempt", "error")
+                    log("OTP code not received within timeout even after resend attempt", "err")
                     await browser.close()
                     return _partial("OTP timeout")
 
-            log(f"OTP received: {otp_code}", "ok")
+            log(f"OTP code received from mail provider: {otp_code}", "info")
 
             # Fill OTP
             await _move_to_element(page, otp_input)
@@ -2017,7 +2017,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             while time.time() < password_deadline and not password_input:
                 attempt += 1
                 if attempt > 1:
-                    log(f"Retry {attempt} - waiting for password page...", "info")
+                    log(f"Retry {attempt} - waiting for password input page to appear", "info")
                     await asyncio.sleep(3)
 
                 for selector in [
@@ -2029,7 +2029,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                         loc = page.locator(selector).first
                         await loc.wait_for(state="visible", timeout=5000)  # 5 second timeout per selector
                         password_input = loc
-                        log(f"Found password input with selector: {selector}", "ok")
+                        log(f"Password input field located with selector: {selector}", "dbg")
                         break
                     except:
                         continue
@@ -2038,13 +2038,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     break
 
             if not password_input:
-                log("Could not find password input field after retries", "error")
+                log("Password input field not found after multiple retry attempts", "err")
                 await browser.close()
                 return _partial("Password input not found")
 
             # Generate password
             password = _generate_password()
-            log("Filling password...", "info")
+            log(f"Filling generated password into input field (length: {len(password)})", "info")
 
             # Fill password
             await _move_to_element(page, password_input)
@@ -2080,7 +2080,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     break
 
             if not confirm_input:
-                log("Could not find confirm password input field after retries", "error")
+                log("Confirm password input field not found after multiple retry attempts", "err")
                 await browser.close()
                 return _partial("Confirm password input not found")
 
@@ -2103,13 +2103,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     if await btn.count() > 0:
                         await btn.first.click()
                         continue_clicked = True
-                        log("Clicked Continue button (password page)", "ok")
+                        log("Continue button clicked on password page to proceed", "info")
                         break
                 except:
                     pass
 
             if not continue_clicked:
-                log("Trying JavaScript fallback for Continue button (password page)...", "warn")
+                log("Continue button not found via selectors, attempting JavaScript fallback on password page", "warn")
                 await page.evaluate("""() => {
                     const btns = Array.from(document.querySelectorAll('button'));
                     const vis = btns.filter(b => b.offsetWidth > 0);
@@ -2138,13 +2138,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     btn = page.locator(selector)
                     await btn.first.wait_for(state="visible", timeout=10000)
                     confirm_button = btn.first
-                    log(f"Found device code confirmation button with selector: {selector}", "ok")
+                    log(f"Device code confirmation button located with selector: {selector}", "dbg")
                     break
                 except:
                     continue
 
             if not confirm_button:
-                log("Could not find device code confirmation button", "error")
+                log("Device code confirmation button not found on authorization page", "err")
                 await browser.close()
                 return _partial("Device code confirmation button not found")
 
@@ -2164,13 +2164,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     btn = page.locator(selector)
                     await btn.first.wait_for(state="visible", timeout=10000)
                     allow_button = btn.first
-                    log(f"Found 'Allow access' button with selector: {selector}", "ok")
+                    log(f"'Allow access' button located with selector: {selector}", "dbg")
                     break
                 except:
                     continue
 
             if not allow_button:
-                log("Could not find 'Allow access' button", "error")
+                log("'Allow access' button not found on OAuth consent page", "err")
                 await browser.close()
                 return _partial("Allow access button not found")
 
@@ -2178,15 +2178,15 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             log("Clicked 'Allow access'", "ok")
             await asyncio.sleep(1)
             await browser.close()
-            log("Browser closed", "ok")
+            log("Playwright browser session closed successfully", "dbg")
 
         except Exception as e:
-            log(f"Browser error: {e}", "error")
+            log(f"Browser automation error during registration flow: {e}", "err")
             await browser.close()
             return _partial(f"browser: {e}")
 
     # Phase 3: Poll 9router
-    log("Phase 3: Polling 9router...")
+    log("Phase 3: Polling 9router API for account export completion", "info")
     poll = r9.poll_account(device_code, client_id, client_secret, code_verifier, log, 3)
 
     exported = poll["ok"]
@@ -2205,13 +2205,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             if skip_onboard:
                 skip_onboarding(log)
         except Exception as e:
-            log(f"Token warning: {e}", "warn")
+            log(f"Token injection warning (non-fatal): {e}", "warn")
 
-    log("=" * 40, "ok")
-    log("9router OAuth registration complete!", "ok")
-    log(f"  Email: {email}", "ok")
-    log(f"  Exported: {exported}", "ok")
-    log("=" * 40, "ok")
+    log("=" * 40, "info")
+    log("9router OAuth device code registration completed successfully!", "ok")
+    log(f"  Account Email: {email}", "info")
+    log(f"  9router Export Status: {exported}", "info")
+    log("=" * 40, "info")
 
     return {
         "email": email,

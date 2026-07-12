@@ -23,8 +23,9 @@ try:
     from kiro_register import register, register_via_9router_oauth
     from mail_providers import get_provider as get_mail_provider, list_providers
 except ImportError as e:
-    print(f"Import error: {e}")
-    print("Make sure you're running from the project root")
+    print(f"❌ Import error: {e}")
+    print("ℹ️  Make sure you're running from the project root and dependencies are installed")
+    print("ℹ️  Try: pip install -r requirements.txt")
     sys.exit(1)
 
 
@@ -32,16 +33,26 @@ def load_config():
     """Load configuration from kiro_config.json"""
     config_path = Path("kiro_config.json")
     if not config_path.exists():
-        print("❌ kiro_config.json not found")
+        print("❌ Config file not found: kiro_config.json")
+        print("ℹ️  Please create kiro_config.json or run main.py GUI first")
         sys.exit(1)
 
+    print("ℹ️  Loading configuration from kiro_config.json")
     with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+
+    provider = config.get("mail_provider", "not set")
+    captcha = config.get("captcha_provider", "manual")
+    proxy = "configured" if config.get("proxy_url") else "none"
+    print(f"ℹ️  Mail provider: {provider}, Captcha: {captcha}, Proxy: {proxy}")
+
+    return config
 
 
 def get_mail_provider_instance(config):
     """Initialize mail provider from config."""
     provider_name = config.get("mail_provider", "shiromail")
+    print(f"ℹ️  Initializing mail provider: {provider_name}")
 
     # Get provider config
     if provider_name == "shiromail":
@@ -52,12 +63,17 @@ def get_mail_provider_instance(config):
         provider_config = config.get("gsuite_imap", {})
     else:
         print(f"❌ Unknown mail provider: {provider_name}")
+        print(f"ℹ️  Available providers: shiromail, yydsmail, gsuite_imap")
         return None
 
     try:
-        return get_mail_provider(provider_name, **provider_config)
+        print(f"ℹ️  Connecting to {provider_name} service...")
+        result = get_mail_provider(provider_name, **provider_config)
+        print(f"✅ Mail provider initialized successfully")
+        return result
     except Exception as e:
         print(f"❌ Failed to initialize mail provider: {e}")
+        print(f"ℹ️  Check your API keys and credentials in kiro_config.json")
         return None
 
 
@@ -70,8 +86,9 @@ def register_one_account(config, use_9router, headless):
 
     MAX_RETRY = 3
     for attempt in range(1, MAX_RETRY + 1):
-        if attempt > 1:
-            print(f"  Retry attempt {attempt}/{MAX_RETRY}...")
+        print(f"\n{'='*60}")
+        print(f"🔄 Registration attempt {attempt}/{MAX_RETRY}")
+        print(f"{'='*60}")
 
         try:
             if use_9router:
@@ -84,9 +101,11 @@ def register_one_account(config, use_9router, headless):
                 }
 
                 if not router9_config.get("base_url") or not router9_config.get("password"):
-                    print("❌ 9router config incomplete")
+                    print("❌ 9router config incomplete: missing base_url or password")
+                    print("ℹ️  Add 'router9_url' and 'router9_password' to kiro_config.json")
                     return None
 
+                print("ℹ️  Using 9router OAuth device code flow...")
                 result = asyncio.run(register_via_9router_oauth(
                     mail_provider_instance=mail_provider,
                     router9_config=router9_config,
@@ -97,6 +116,7 @@ def register_one_account(config, use_9router, headless):
                     cancel_check=None
                 ))
             else:
+                print("ℹ️  Using standard registration flow...")
                 result = asyncio.run(register(
                     mail_provider_instance=mail_provider,
                     headless=headless,
@@ -113,36 +133,48 @@ def register_one_account(config, use_9router, headless):
                     fail_reason = result.get("failReason", "Unknown")
                     print(f"❌ Registration incomplete: {fail_reason}")
 
+                    if "TES" in fail_reason or "Blocked" in fail_reason:
+                        print("⚠️  AWS Trust Evaluation Service (TES) block detected")
+                        print("ℹ️  Consider using residential proxy or reducing velocity")
+
+                    if "device code" in fail_reason.lower() and "expired" in fail_reason.lower():
+                        print("⚠️  9router device code expired - re-authentication needed")
+
                     if attempt < MAX_RETRY:
                         # TES blocks need longer cooling (synced with main.py)
                         is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
                         retry_delay = (10 + (attempt * 20)) if is_tes_block else (5 + (attempt * 3))
-                        print(f"  Waiting {retry_delay}s before retry...")
+                        print(f"⏳ Waiting {retry_delay}s before retry (reason: {'TES cooldown' if is_tes_block else 'standard backoff'})...")
                         time.sleep(retry_delay)
                     continue
 
                 # Success - account complete and healthy
                 email = result["email"]
                 exported = result.get("router9_exported", False)
-                print(f"✅ Success! Email: {email}")
+                print(f"✅ Registration successful!")
+                print(f"   Email: {email}")
                 if use_9router:
-                    print(f"   Exported: {'Yes' if exported else 'No'}")
+                    export_status = 'Yes ✅' if exported else 'No ⚠️'
+                    print(f"   Exported to 9router: {export_status}")
                 return result
             else:
                 # No result or no email
-                print(f"❌ Failed: No result returned")
+                print(f"❌ Registration failed: No result returned from registration flow")
                 if attempt < MAX_RETRY:
-                    print(f"  Waiting 5s before retry...")
+                    print(f"⏳ Waiting 5s before retry (attempt {attempt + 1}/{MAX_RETRY})...")
                     time.sleep(5)
 
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"❌ Registration error: {e}")
+            import traceback
+            print(f"ℹ️  Stack trace: {traceback.format_exc()}")
             if attempt < MAX_RETRY:
-                print(f"  Waiting 5s before retry...")
+                print(f"⏳ Waiting 5s before retry (attempt {attempt + 1}/{MAX_RETRY})...")
                 time.sleep(5)
 
     # All retries exhausted
-    print(f"❌ Failed after {MAX_RETRY} attempts")
+    print(f"❌ Registration failed after {MAX_RETRY} attempts")
+    print(f"ℹ️  Check config, proxy settings, and try again later")
     return None
 
 
@@ -178,17 +210,21 @@ def run_batch(count, delay, use_9router, headless):
     failed = 0
 
     for i in range(1, count + 1):
-        print(f"\n[{i}/{count}] Starting registration...")
+        print(f"\n{'='*60}")
+        print(f"[{i}/{count}] Starting registration...")
+        print(f"{'='*60}")
 
         result = register_one_account(config, use_9router, headless)
 
         if result:
             successful += 1
+            print(f"\n✅ Account {i}/{count} registered successfully")
         else:
             failed += 1
+            print(f"\n❌ Account {i}/{count} registration failed")
 
         if i < count:
-            print(f"\n⏳ Waiting {delay}s...")
+            print(f"\n⏳ Waiting {delay}s before next registration...")
             time.sleep(delay)
 
     print_stats("BATCH", count, successful, failed, count)
@@ -215,21 +251,27 @@ def run_service(delay, use_9router, headless):
     try:
         while True:
             total += 1
-            print(f"\n[Account #{total}] Starting registration...")
+            print(f"\n{'='*60}")
+            print(f"[Account #{total}] Starting registration...")
+            print(f"Progress: ✅ {successful} | ❌ {failed}")
+            print(f"{'='*60}")
 
             result = register_one_account(config, use_9router, headless)
 
             if result:
                 successful += 1
+                print(f"\n✅ Account #{total} registered successfully")
             else:
                 failed += 1
+                print(f"\n❌ Account #{total} registration failed")
 
-            print(f"\n⏳ Waiting {delay}s...")
+            print(f"\n⏳ Waiting {delay}s before next registration...")
             time.sleep(delay)
             print_stats("SERVICE", None, successful, failed, total)
 
     except KeyboardInterrupt:
         print("\n\n⚠️  Service mode stopped by user (Ctrl+C)")
+        print(f"ℹ️  Final statistics:")
         print_stats("SERVICE", None, successful, failed, total)
 
 
@@ -265,23 +307,30 @@ def run_batch_loop(count, account_delay, batch_delay, use_9router, headless):
 
             for i in range(1, count + 1):
                 total_accounts += 1
-                print(f"\n[Batch {batch_num}, Account {i}/{count}] Starting registration...")
+                print(f"\n{'='*60}")
+                print(f"[Batch {batch_num}, Account {i}/{count}] Starting registration...")
+                print(f"{'='*60}")
 
                 result = register_one_account(config, use_9router, headless)
 
                 if result:
                     batch_successful += 1
                     total_successful += 1
+                    print(f"\n✅ Batch {batch_num}, Account {i}/{count} registered successfully")
                 else:
                     batch_failed += 1
                     total_failed += 1
+                    print(f"\n❌ Batch {batch_num}, Account {i}/{count} registration failed")
 
                 if i < count:
-                    print(f"\n⏳ Account delay {account_delay}s...")
+                    print(f"\n⏳ Account delay {account_delay}s before next account...")
                     time.sleep(account_delay)
 
-            print(f"\nBatch #{batch_num} complete: ✅ {batch_successful} | ❌ {batch_failed}")
-            print(f"Total so far: ✅ {total_successful} | ❌ {total_failed}")
+            print(f"\n{'='*60}")
+            print(f"✅ Batch #{batch_num} complete")
+            print(f"   Batch: ✅ {batch_successful} | ❌ {batch_failed}")
+            print(f"   Total: ✅ {total_successful} | ❌ {total_failed}")
+            print(f"{'='*60}")
 
             print(f"\n⏳ Batch delay {batch_delay}s before next batch...")
             time.sleep(batch_delay)

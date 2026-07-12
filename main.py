@@ -1643,7 +1643,7 @@ class App(tk.Tk):
             import random
             try:
                 self._reg_import_to_db(result)
-                self._reg_queue.put(("Account auto-imported into the database", "ok"))
+                self._reg_queue.put((f"✓ Account imported into database: {result['email']}", "ok"))
                 self._refresh_after_import(result.get("email", ""), self._reg_queue)
 
                 # Auto-export to 9router if enabled
@@ -1658,7 +1658,7 @@ class App(tk.Tk):
                         if exporter.check_connection():
                             export_result = exporter.export_account_result(result, log=self._reg_log)
                             if export_result["ok"]:
-                                self._reg_queue.put(("✓ Account exported to 9router", "ok"))
+                                self._reg_queue.put((f"✓ Account exported to 9router: {result['email']}", "ok"))
                             else:
                                 self._reg_queue.put((f"9router export failed: {export_result.get('error', 'unknown')}", "warn"))
                         else:
@@ -1674,9 +1674,9 @@ class App(tk.Tk):
             if pro_trial and result.get("accessToken"):
                 self._reg_queue.put(("", "info"))
                 warmup = random.randint(30, 90)
-                self._reg_queue.put((f"Warm-up wait {warmup}s, simulating normal usage spacing...", "info"))
+                self._reg_queue.put((f"Warm-up delay: waiting {warmup}s to simulate natural user behavior before subscription", "info"))
                 time.sleep(warmup)
-                self._reg_queue.put(("Starting the Pro trial subscription...", "info"))
+                self._reg_queue.put((f"Starting Pro trial subscription for {result['email']}...", "info"))
                 try:
                     loop.run_until_complete(
                         self._reg_pro_trial_subscribe(result, loop)
@@ -1700,13 +1700,13 @@ class App(tk.Tk):
             try:
                 for attempt in range(1, MAX_RETRY + 1):
                     if self._reg_cancel:
-                        self._reg_queue.put(("User cancelled; stopping retries", "warn"))
+                        self._reg_queue.put(("Registration cancelled by user; stopping retry loop", "warn"))
                         break
                     if attempt > 1:
                         wait = random.randint(10, 30)
-                        self._reg_queue.put((f"Wait {wait}s s before starting # {attempt}/{MAX_RETRY}  registration attempts...", "info"))
+                        self._reg_queue.put((f"Retry delay: waiting {wait}s before attempt [{attempt}/{MAX_RETRY}]", "info"))
                         time.sleep(wait)
-                    self._reg_queue.put((f"[{attempt}/{MAX_RETRY}] Registration thread started; initialising...", "info"))
+                    self._reg_queue.put((f"[{attempt}/{MAX_RETRY}] Starting registration attempt (headless={headless}, concurrency={self._reg_concurrency.get()})", "info"))
                     try:
                         result = loop.run_until_complete(
                             self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy)
@@ -1717,14 +1717,15 @@ class App(tk.Tk):
                         continue
 
                     if not result or not result.get("email"):
-                        self._reg_queue.put(("Registration flow ended (no result returned))", "err"))
+                        self._reg_queue.put((f"[{attempt}/{MAX_RETRY}] Registration flow returned no result; retrying", "err"))
                         continue
 
-                    self._reg_queue.put((f"Email: {result['email']}", "highlight"))
-                    self._reg_queue.put((f"Password: {result['password']}", "highlight"))
+                    self._reg_queue.put((f"[{attempt}/{MAX_RETRY}] ✓ Registration successful: {result['email']}", "ok"))
+                    self._reg_queue.put((f"  Email: {result['email']}", "highlight"))
+                    self._reg_queue.put((f"  Password: {result['password']}", "highlight"))
 
                     # Account health check
-                    self._reg_queue.put(("Checking account status...", "info"))
+                    self._reg_queue.put(("Verifying account health (checking for bans/trial status)...", "info"))
                     status, reason = _check_account_health(result)
 
                     if status == "banned":
@@ -1755,10 +1756,10 @@ class App(tk.Tk):
                             is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
                             if is_tes_block:
                                 retry_delay = 15 + (attempt * 10)  # 15s, 25s, 35s
-                                self._reg_queue.put((f"AWS TES block detected. Waiting {retry_delay}s before retry {attempt + 1}/{MAX_RETRY}...", "warn"))
+                                self._reg_queue.put((f"⚠ AWS TES block detected. Cooling down {retry_delay}s before retry [{attempt + 1}/{MAX_RETRY}]", "warn"))
                             else:
                                 retry_delay = 5 + (attempt * 3)  # 5s, 8s, 11s
-                                self._reg_queue.put((f"Waiting {retry_delay}s before retry {attempt + 1}/{MAX_RETRY}...", "warn"))
+                                self._reg_queue.put((f"Non-TES failure. Waiting {retry_delay}s before retry [{attempt + 1}/{MAX_RETRY}]", "warn"))
 
                             # Sleep with cancel check
                             for _ in range(retry_delay * 10):
@@ -1773,7 +1774,7 @@ class App(tk.Tk):
                     _do_import_and_subscribe(result, loop)
                     break
                 else:
-                    self._reg_queue.put((f"Maximum retry count reached ({MAX_RETRY}), stopping", "err"))
+                    self._reg_queue.put((f"⛔ Maximum retry limit reached ({MAX_RETRY} attempts exhausted). Registration failed.", "err"))
                 loop.close()
             except Exception as e:
                 self._reg_queue.put((f"Registration error: {e}", "err"))
@@ -1838,7 +1839,7 @@ class App(tk.Tk):
     def _reg_stop(self):
         """Signal the registration to abort."""
         self._reg_cancel = True
-        self._reg_log("User requested stop...", "err")
+        self._reg_log("⏹ Stop requested by user; cancelling active registration operations...", "warn")
 
     def _reg_pro_only(self):
         """Skip registration; run the Pro trial subscription against the most recent account already in the database"""
@@ -1861,8 +1862,8 @@ class App(tk.Tk):
         self._reg_running = True
         self._reg_cancel = False
         self._reg_term.delete("1.0", "end")
-        self._reg_term.insert("end", f"{datetime.now().strftime('%H:%M:%S')} [*] Run only the Pro trial subscription...\n", "info")
-        self._reg_term.insert("end", f"  Account: {row['email']}\n", "info")
+        self._reg_term.insert("end", f"{datetime.now().strftime('%H:%M:%S')} [*] PRO-ONLY MODE: Subscribing existing account to Pro trial (no registration)\n", "info")
+        self._reg_term.insert("end", f"  Target account: {row['email']}\n", "info")
         self._reg_start_btn.configure(state="disabled")
         self._reg_pro_only_btn.configure(state="disabled")
         self._reg_stop_btn.configure(state="normal")
@@ -1917,7 +1918,7 @@ class App(tk.Tk):
         self._reg_running = True
         self._reg_cancel = False
         self._reg_term.delete("1.0", "end")
-        self._reg_term.insert("end", f"[*] BATCH MODE: {count} accounts, {delay}s delay\n", "info")
+        self._reg_term.insert("end", f"[*] BATCH MODE STARTED: {count} accounts, {delay}s delay between accounts, max 3 retries per account\n", "info")
         self._reg_start_btn.configure(state="disabled")
         self._reg_auto_btn.configure(state="disabled")
         self._reg_continuous_btn.configure(state="disabled")
@@ -1931,10 +1932,11 @@ class App(tk.Tk):
 
             for i in range(1, count + 1):
                 if self._reg_cancel:
-                    self._reg_queue.put((f"Stopped by user at {i-1}/{count}", "warn"))
+                    self._reg_queue.put((f"Batch stopped by user at account {i-1}/{count}", "warn"))
                     break
 
-                self._reg_queue.put((f"\n[{i}/{count}] Starting registration...", "info"))
+                self._reg_queue.put((f"\n{'='*50}", "info"))
+                self._reg_queue.put((f"[Account {i}/{count}] Starting registration attempt...", "info"))
 
                 # Retry loop per account
                 MAX_RETRY = 3
@@ -1945,7 +1947,7 @@ class App(tk.Tk):
                         break
 
                     if attempt > 1:
-                        self._reg_queue.put((f"  Retry attempt {attempt}/{MAX_RETRY}...", "info"))
+                        self._reg_queue.put((f"  [Account {i}/{count}] Retry attempt [{attempt}/{MAX_RETRY}]", "info"))
 
                     try:
                         loop = asyncio.new_event_loop()
@@ -2023,17 +2025,17 @@ class App(tk.Tk):
                     failed += 1
 
                 if i < count and not self._reg_cancel:
-                    self._reg_queue.put((f"⏳ Waiting {delay}s...", "info"))
+                    self._reg_queue.put((f"⏳ Account delay: waiting {delay}s before next registration [{i+1}/{count}]", "info"))
                     for _ in range(delay * 10):
                         if self._reg_cancel:
                             break
                         time.sleep(0.1)
 
             self._reg_queue.put((f"\n{'='*50}", "info"))
-            self._reg_queue.put((f"BATCH COMPLETE", "info"))
-            self._reg_queue.put((f"  Total: {count}", "info"))
-            self._reg_queue.put((f"  Success: {successful}", "ok"))
-            self._reg_queue.put((f"  Failed: {failed}", "err"))
+            self._reg_queue.put((f"BATCH MODE COMPLETED", "info"))
+            self._reg_queue.put((f"  Total accounts attempted: {count}", "info"))
+            self._reg_queue.put((f"  ✓ Successful: {successful}", "ok"))
+            self._reg_queue.put((f"  ✗ Failed: {failed}", "err"))
             self._reg_queue.put((f"{'='*50}", "info"))
 
             self._reg_running = False
@@ -2065,10 +2067,11 @@ class App(tk.Tk):
         self._reg_running = True
         self._reg_cancel = False
         self._reg_term.delete("1.0", "end")
-        self._reg_term.insert("end", f"[*] CONTINUOUS MODE\n", "info")
-        self._reg_term.insert("end", f"    Batch: {batch_count} accounts\n", "info")
+        self._reg_term.insert("end", f"[*] CONTINUOUS MODE STARTED (runs until stopped)\n", "info")
+        self._reg_term.insert("end", f"    Accounts per batch: {batch_count}\n", "info")
         self._reg_term.insert("end", f"    Account delay: {account_delay}s\n", "info")
         self._reg_term.insert("end", f"    Batch delay: {batch_delay}s\n", "info")
+        self._reg_term.insert("end", f"    Max retries per account: 3\n", "info")
         self._reg_term.insert("end", f"    Stop: Press 'Stop' button\n", "info")
         self._reg_start_btn.configure(state="disabled")
         self._reg_auto_btn.configure(state="disabled")
@@ -2088,14 +2091,14 @@ class App(tk.Tk):
                 batch_failed = 0
 
                 self._reg_queue.put((f"\n{'='*50}", "info"))
-                self._reg_queue.put((f"BATCH #{batch_num}", "info"))
+                self._reg_queue.put((f"BATCH #{batch_num} STARTED", "info"))
                 self._reg_queue.put((f"{'='*50}", "info"))
 
                 for i in range(1, batch_count + 1):
                     if self._reg_cancel:
                         break
 
-                    self._reg_queue.put((f"\n[Batch {batch_num}, Account {i}/{batch_count}]", "info"))
+                    self._reg_queue.put((f"\n[Batch #{batch_num}, Account {i}/{batch_count}] Starting registration...", "info"))
 
                     # Retry loop per account
                     MAX_RETRY = 3
@@ -2106,7 +2109,7 @@ class App(tk.Tk):
                             break
 
                         if attempt > 1:
-                            self._reg_queue.put((f"  Retry attempt {attempt}/{MAX_RETRY}...", "info"))
+                            self._reg_queue.put((f"  [Batch #{batch_num}, Account {i}/{batch_count}] Retry [{attempt}/{MAX_RETRY}]", "info"))
 
                         try:
                             loop = asyncio.new_event_loop()
@@ -2133,7 +2136,8 @@ class App(tk.Tk):
                                         # TES blocks need longer cooling
                                         is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
                                         retry_delay = (15 + (attempt * 10)) if is_tes_block else (5 + (attempt * 3))
-                                        self._reg_queue.put((f"  Waiting {retry_delay}s before retry...", "warn"))
+                                        delay_reason = "TES block cooldown" if is_tes_block else "standard retry delay"
+                                        self._reg_queue.put((f"  ⚠ {delay_reason}: waiting {retry_delay}s before retry [{attempt + 1}/{MAX_RETRY}]", "warn"))
 
                                         for _ in range(retry_delay * 10):
                                             if self._reg_cancel:
@@ -2192,13 +2196,13 @@ class App(tk.Tk):
                                 break
                             time.sleep(0.1)
 
-                self._reg_queue.put((f"\nBatch #{batch_num} complete: ✅ {batch_successful} | ❌ {batch_failed}", "info"))
-                self._reg_queue.put((f"Total so far: ✅ {total_successful} | ❌ {total_failed}", "info"))
+                self._reg_queue.put((f"\nBatch #{batch_num} completed: ✅ {batch_successful} successful | ❌ {batch_failed} failed", "info"))
+                self._reg_queue.put((f"Cumulative totals: ✅ {total_successful} successful | ❌ {total_failed} failed", "info"))
 
                 if self._reg_cancel:
                     break
 
-                self._reg_queue.put((f"\n⏳ Batch delay {batch_delay}s before next batch...", "info"))
+                self._reg_queue.put((f"\n⏳ Batch delay: waiting {batch_delay}s before starting batch #{batch_num + 1}", "info"))
                 for _ in range(batch_delay * 10):
                     if self._reg_cancel:
                         break
@@ -2206,9 +2210,9 @@ class App(tk.Tk):
 
             self._reg_queue.put((f"\n{'='*50}", "info"))
             self._reg_queue.put((f"CONTINUOUS MODE STOPPED", "warn"))
-            self._reg_queue.put((f"  Total batches: {batch_num}", "info"))
-            self._reg_queue.put((f"  Total success: {total_successful}", "ok"))
-            self._reg_queue.put((f"  Total failed: {total_failed}", "err"))
+            self._reg_queue.put((f"  Total batches completed: {batch_num}", "info"))
+            self._reg_queue.put((f"  ✓ Total successful: {total_successful}", "ok"))
+            self._reg_queue.put((f"  ✗ Total failed: {total_failed}", "err"))
             self._reg_queue.put((f"{'='*50}", "info"))
 
             self._reg_running = False
@@ -2380,13 +2384,14 @@ class App(tk.Tk):
         cdk_code = self._reg_cdk_code.get().strip()
 
         if not cdk_code:
-            log("CDK code not provided; skipping Pro trial subscription", "err")
+            log("⚠ CDK code not configured; skipping Pro trial subscription flow", "warn")
             return
 
         # Step 1: Query available plans
+        log("Querying available subscription plans from AWS...", "info")
         subs = kiro_subscribe.list_available_subscriptions(access_token, profile_arn, log=log)
         if not subs.get("ok"):
-            log("Failed to fetch the subscription plan list", "err")
+            log("❌ Failed to fetch subscription plan list from AWS", "err")
             return
 
         # Found the KIRO_PRO plan
@@ -2402,35 +2407,37 @@ class App(tk.Tk):
         if not pro_type:
             pro_type = "KIRO_PRO"
 
-        log(f"Subscription type: {pro_type}", "info")
+        log(f"✓ Detected subscription plan: {pro_type}", "info")
 
         # Step 2: Fetching the Stripe payment URL
+        log("Generating Stripe checkout session URL...", "info")
         token_result = kiro_subscribe.create_subscription_token(
             access_token, profile_arn, pro_type, log=log
         )
         if not token_result.get("ok") or not token_result.get("url"):
-            log("Failed to fetch payment URL", "err")
+            log("❌ Failed to generate Stripe payment URL", "err")
             return
 
         payment_url = token_result["url"]
-        log(f"Payment URL: {payment_url[:80]}...", "info")
+        log(f"✓ Payment URL generated: {payment_url[:80]}...", "info")
 
         # Step 3: Pre-check — Open the Stripe page to determine whether $0 Trial
-        log("Probe trial status: open the payment page and read the amount due today...", "info")
+        log("Verifying trial status: checking Stripe checkout page for $0 trial eligibility...", "info")
         page_info = await kiro_subscribe.fetch_checkout_page_async(payment_url, log=log)
         if page_info:
             is_free = page_info.get("is_free_trial", False)
             total_due = page_info.get("total_due_today", "unknown")
-            log(f"Due today: {total_due}", "info")
+            log(f"Amount due today: {total_due}", "info")
             if not is_free:
-                log(f"non- $0 trial (due today: {total_due}), aborting subscription so the CDK card is not consumed", "err")
+                log(f"⚠ Non-$0 trial detected (due today: {total_due}). Aborting to preserve CDK card.", "err")
                 return
-            log("Confirm as $0 free trial; continuing with automatic payment...", "ok")
+            log("✓ Confirmed $0 free trial. Proceeding with automated payment flow...", "ok")
         else:
-            log("Could not read the amount from the page (the link may have expired); aborting", "err")
+            log("❌ Could not verify trial amount (payment link may be expired). Aborting.", "err")
             return
 
         # Step 4: Use EFunCard + Stripe Auto-pay
+        log(f"Initiating Stripe checkout automation with CDK card (code: {cdk_code[:4]}****{cdk_code[-4:]})...", "info")
         captcha_cfg = {
             "yescaptcha_key": yescaptcha_key,
             "multibot_key": multibot_key,
@@ -2441,7 +2448,7 @@ class App(tk.Tk):
         )
 
         if pay_result and pay_result.get("ok"):
-            log("Pro Trial subscription succeeded!", "ok")
+            log(f"✓ Pro trial subscription completed successfully for {result['email']}", "ok")
             try:
                 rows = db_get_all(self.conn)
                 for row in rows:
@@ -2456,10 +2463,10 @@ class App(tk.Tk):
             except Exception:
                 pass
         elif pay_result and pay_result.get("status") == "not_free_trial":
-            log(f"This account is not eligible for the free trial: {pay_result.get('message', '')}", "err")
+            log(f"❌ Account not eligible for free trial: {pay_result.get('message', 'Unknown reason')}", "err")
         else:
             reason = pay_result.get("message", str(pay_result)) if pay_result else "Unknown error"
-            log(f"Pro Trial subscription incomplete: {reason}", "err")
+            log(f"❌ Pro trial subscription failed: {reason}", "err")
 
     # ─── Tab 4: Manual sign-in ─────────────────────────────────────────────────
     def _build_tab_manual_login(self):
