@@ -30,14 +30,56 @@ except ImportError as e:
 
 
 def load_config():
-    """Load configuration from kiro_config.json"""
-    config_path = Path("kiro_config.json")
-    if not config_path.exists():
-        print("❌ Config file not found: kiro_config.json")
-        print("ℹ️  Please create kiro_config.json or run main.py GUI first")
-        sys.exit(1)
+    """Load configuration from kiro_config.json or CONFIG_PATH env var"""
+    config_path = Path(os.getenv("CONFIG_PATH", "kiro_config.json"))
 
-    print("ℹ️  Loading configuration from kiro_config.json")
+    # Generate default config from env vars if file doesn't exist
+    if not config_path.exists():
+        print(f"ℹ️  Config file not found: {config_path}")
+        print("ℹ️  Generating config from environment variables...")
+
+        config = {
+            "mail_provider": os.getenv("MAIL_PROVIDER", "gsuite_imap"),
+            "captcha_provider": os.getenv("CAPTCHA_PROVIDER", "multibot"),
+            "proxy_url": os.getenv("PROXY_URL", ""),
+            "router9_url": os.getenv("ROUTER9_URL", ""),
+            "router9_password": os.getenv("ROUTER9_PASSWORD", ""),
+        }
+
+        # Mail provider specific config
+        if config["mail_provider"] == "shiromail":
+            config["shiromail"] = {
+                "base_url": os.getenv("SHIROMAIL_BASE_URL", ""),
+                "api_key": os.getenv("SHIROMAIL_API_KEY", ""),
+                "domain_id": int(os.getenv("SHIROMAIL_DOMAIN_ID", "1"))
+            }
+        elif config["mail_provider"] == "yydsmail":
+            config["yydsmail"] = {
+                "base_url": os.getenv("YYDSMAIL_BASE_URL", ""),
+                "api_key": os.getenv("YYDSMAIL_API_KEY", "")
+            }
+        elif config["mail_provider"] == "gsuite_imap":
+            config["imap_server"] = os.getenv("IMAP_SERVER", "imap.gmail.com")
+            config["imap_port"] = os.getenv("IMAP_PORT", "993")
+            config["imap_user"] = os.getenv("IMAP_USER", "")
+            config["imap_pass"] = os.getenv("IMAP_PASS", "")
+            config["imap_domains_file"] = os.getenv("DOMAINS_PATH", "domains.txt")
+
+        # Captcha config
+        if config["captcha_provider"] == "yescaptcha":
+            config["yescaptcha_api_key"] = os.getenv("YESCAPTCHA_API_KEY", "")
+        elif config["captcha_provider"] == "multibot":
+            config["multibot_key"] = os.getenv("MULTIBOT_KEY", "")
+
+        # Save generated config
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        print(f"✓ Generated config file: {config_path}")
+
+        return config
+
+    print(f"ℹ️  Loading configuration from {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
