@@ -50,7 +50,9 @@ def load_config():
 
 
 def get_mail_provider_instance(config):
-    """Initialize mail provider from config."""
+    """Initialize mail provider from config with env var fallback."""
+    import os
+
     provider_name = config.get("mail_provider", "shiromail")
     print(f"ℹ️  Initializing mail provider: {provider_name}")
 
@@ -60,7 +62,29 @@ def get_mail_provider_instance(config):
     elif provider_name == "yydsmail":
         provider_config = config.get("yydsmail", {})
     elif provider_name == "gsuite_imap":
+        # Check both nested and flat config structure
         provider_config = config.get("gsuite_imap", {})
+
+        # Fallback to flat config (root level keys)
+        if not provider_config:
+            provider_config = {
+                "imap_user": config.get("imap_user", ""),
+                "imap_pass": config.get("imap_pass", ""),
+                "imap_server": config.get("imap_server", "imap.gmail.com"),
+                "imap_port": int(config.get("imap_port", 993)),
+                "local_prefix": config.get("imap_local_prefix", "aws"),
+                "local_length": int(config.get("imap_local_length", 10)),
+            }
+
+        # Env var fallback
+        provider_config.setdefault("imap_user", os.getenv("GSUITE_IMAP_EMAIL", ""))
+        provider_config.setdefault("imap_pass", os.getenv("GSUITE_IMAP_PASSWORD", ""))
+        provider_config.setdefault("imap_server", os.getenv("GSUITE_IMAP_SERVER", "imap.gmail.com"))
+        provider_config.setdefault("imap_port", int(os.getenv("GSUITE_IMAP_PORT", "993")))
+
+        user = provider_config.get("imap_user", "")
+        has_pass = bool(provider_config.get("imap_pass"))
+        print(f"ℹ️  IMAP credentials: user={user}, pass={'***' if has_pass else 'MISSING'}")
     else:
         print(f"❌ Unknown mail provider: {provider_name}")
         print(f"ℹ️  Available providers: shiromail, yydsmail, gsuite_imap")
@@ -84,6 +108,10 @@ def register_one_account(config, use_9router, headless):
         print("❌ Failed to initialize mail provider")
         return None
 
+    # Cache for retry persistence
+    cached_email = None
+    cached_device_code_data = None
+
     MAX_RETRY = 3
     for attempt in range(1, MAX_RETRY + 1):
         print(f"\n{'='*60}")
@@ -106,6 +134,13 @@ def register_one_account(config, use_9router, headless):
                     return None
 
                 print("ℹ️  Using 9router OAuth device code flow...")
+                if cached_email:
+                    print(f"ℹ️  Reusing cached email: {cached_email}")
+                if cached_device_code_data:
+                    expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
+                    remaining = max(0, int(expires_at_timestamp - time.time()))
+                    print(f"ℹ️  Reusing cached device code (expires in {remaining}s)")
+
                 result = asyncio.run(register_via_9router_oauth(
                     mail_provider_instance=mail_provider,
                     router9_config=router9_config,
@@ -113,7 +148,9 @@ def register_one_account(config, use_9router, headless):
                     proxy_url=config.get("proxy_url"),
                     auto_login=True,
                     skip_onboard=True,
-                    cancel_check=None
+                    cancel_check=None,
+                    cached_email=cached_email,
+                    cached_device_code_data=cached_device_code_data
                 ))
             else:
                 print("ℹ️  Using standard registration flow...")
@@ -127,6 +164,24 @@ def register_one_account(config, use_9router, headless):
                 ))
 
             if result and result.get("email"):
+                # Cache email AND device code for next retry
+                cached_email = result.get("email")
+                cached_device_code_data = result.get("device_code_info")
+
+                if cached_email:
+                    print(f"ℹ️  Email cached: {cached_email}")
+
+                if cached_device_code_data:
+                    expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
+                    remaining = max(0, int(expires_at_timestamp - time.time()))
+                    print(f"ℹ️  Device code cached (expires in {remaining}s)")
+
+                    # Check if expired - clear cache if so
+                    if remaining <= 0:
+                        print(f"⚠️  Device code expired, will generate fresh email + device code on next retry")
+                        cached_email = None
+                        cached_device_code_data = None
+
                 # Check if incomplete (TES block, export failure, etc.)
                 is_incomplete = result.get("incomplete", False)
                 if is_incomplete:

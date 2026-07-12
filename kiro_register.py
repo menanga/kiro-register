@@ -1497,7 +1497,9 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                                      mail_provider_instance=None,
                                      router9_config=None,
                                      proxy_url=None,
-                                     log=print, cancel_check=None):
+                                     log=print, cancel_check=None,
+                                     cached_email=None,
+                                     cached_device_code_data=None):
     """
     Register AWS Builder ID via 9router OAuth device code flow.
 
@@ -1512,6 +1514,10 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
         router9_config: dict with {base_url, password, auth_token, auth_token_expires_at}
         proxy_url: optional HTTP/SOCKS proxy
         log: logging callback
+        cached_email: optional pre-generated email to reuse (avoids creating new mailbox)
+        cached_device_code_data: optional dict with device code to reuse if not expired
+            {device_code, verification_uri_complete, client_id, client_secret,
+             code_verifier, region, user_code, expires_at_timestamp}
         cancel_check: callable returning True to abort
 
     Returns:
@@ -1543,7 +1549,22 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
         return None
 
     mail = mail_provider_instance
-    email = mail.create_mailbox()
+
+    # Email cache reuse
+    if cached_email:
+        email = cached_email
+        log(f"Reusing cached email: {email}", "dbg")
+        # Reset mail provider state to allow polling new OTP
+        if hasattr(mail, '_seen_uids'):
+            mail._seen_uids = set()
+            log("Reset mail provider seen UIDs for fresh OTP polling", "dbg")
+        if hasattr(mail, '_created_at'):
+            mail._created_at = time.time()
+            log("Reset mail provider created timestamp", "dbg")
+    else:
+        email = mail.create_mailbox()
+        log(f"Generated new email: {email}", "dbg")
+
     password = _generate_password()
     full_name = _generate_name()
     log(f"Email: {email}", "ok")
@@ -1554,6 +1575,16 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             "provider": "BuilderId", "authMethod": "IdC", "region": "us-east-1",
             "accessToken": "", "refreshToken": "", "incomplete": True,
             "failReason": reason, "router9_exported": False,
+            "device_code_info": {
+                "device_code": device_code if 'device_code' in locals() else "",
+                "verification_uri_complete": verify_url if 'verify_url' in locals() else "",
+                "client_id": client_id if 'client_id' in locals() else "",
+                "client_secret": client_secret if 'client_secret' in locals() else "",
+                "code_verifier": code_verifier if 'code_verifier' in locals() else "",
+                "region": region,
+                "user_code": user_code if 'user_code' in locals() else "",
+                "expires_at_timestamp": device_code_expires_at if 'device_code_expires_at' in locals() else 0,
+            } if 'device_code' in locals() else None,
         }
 
     # Phase 1: 9router device code
@@ -1572,18 +1603,34 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
     router9_config["auth_token_expires_at"] = expires
     r9.auth_token = token  # Ensure instance variable is set for poll_account()
 
-    dev = r9.get_device_code(log)
-    if not dev["ok"]:
-        return _partial("device code failed")
+    # Device code cache reuse
+    if cached_device_code_data and time.time() < cached_device_code_data.get('expires_at_timestamp', 0):
+        device_code = cached_device_code_data['device_code']
+        verify_url = cached_device_code_data['verification_uri_complete']
+        client_id = cached_device_code_data['client_id']
+        client_secret = cached_device_code_data['client_secret']
+        code_verifier = cached_device_code_data['code_verifier']
+        region = cached_device_code_data.get('region', 'us-east-1')
+        user_code = cached_device_code_data.get('user_code', '')
+        device_code_expires_at = cached_device_code_data['expires_at_timestamp']
+        remaining = int(device_code_expires_at - time.time())
+        log(f"Reusing cached device code (user_code: {user_code}, expires in {remaining}s)", "dbg")
+    else:
+        dev = r9.get_device_code(log)
+        if not dev["ok"]:
+            return _partial("device code failed")
 
-    device_code = dev["device_code"]
-    verify_url = dev["verification_uri_complete"]
-    client_id = dev["_clientId"]
-    client_secret = dev["_clientSecret"]
-    code_verifier = dev["codeVerifier"]
-    region = dev.get("_region", "us-east-1")
+        device_code = dev["device_code"]
+        verify_url = dev["verification_uri_complete"]
+        client_id = dev["_clientId"]
+        client_secret = dev["_clientSecret"]
+        code_verifier = dev["codeVerifier"]
+        region = dev.get("_region", "us-east-1")
+        user_code = dev.get("user_code", "")
+        device_code_expires_at = time.time() + 600  # 10 minutes from now
+        log(f"Generated new device code (user_code: {user_code}, expires in 600s)", "dbg")
 
-    log(f"Device code obtained - User code: {dev.get('user_code', 'N/A')}", "info")
+    log(f"Device code obtained - User code: {user_code}", "info")
     log(f"Device code obtained - Verification URL: {verify_url[:60]}...", "dbg")
 
     # Phase 2: Browser automation
@@ -1904,6 +1951,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
             # Get OTP from email
             log("Waiting for OTP code from email...", "info")
+            log(f"Mail provider: {mail_provider_instance.__class__.__name__}", "dbg")
             otp_code = ""
             otp_deadline = time.time() + 90
             while time.time() < otp_deadline:
@@ -1914,8 +1962,10 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     otp_code = mail_provider_instance.wait_otp(timeout=5, poll_interval=3)
                     if otp_code:
                         break
-                except:
-                    pass
+                except Exception as e:
+                    log(f"OTP polling error: {e}", "warn")
+                    import traceback
+                    traceback.print_exc()
 
             if not otp_code:
                 # Try to resend OTP and retry once
@@ -1953,8 +2003,10 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                             if otp_code:
                                 log(f"OTP received after resend: {otp_code}", "ok")
                                 break
-                        except:
-                            pass
+                        except Exception as e:
+                            log(f"OTP polling error after resend: {e}", "warn")
+                            import traceback
+                            traceback.print_exc()
 
                 if not otp_code:
                     log("OTP code not received within timeout even after resend attempt", "err")
@@ -2227,4 +2279,14 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
         "refreshToken": "",
         "expiresAt": (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y/%m/%d %H:%M:%S"),
         "router9_exported": exported,
+        "device_code_info": {
+            "device_code": device_code,
+            "verification_uri_complete": verify_url,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code_verifier": code_verifier,
+            "region": region,
+            "user_code": user_code,
+            "expires_at_timestamp": device_code_expires_at,
+        },
     }

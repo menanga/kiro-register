@@ -1938,6 +1938,10 @@ class App(tk.Tk):
                 self._reg_queue.put((f"\n{'='*50}", "info"))
                 self._reg_queue.put((f"[Account {i}/{count}] Starting registration attempt...", "info"))
 
+                # Cache for retry persistence (per account scope)
+                cached_email = None
+                cached_device_code_data = None
+
                 # Retry loop per account
                 MAX_RETRY = 3
                 account_success = False
@@ -1959,11 +1963,38 @@ class App(tk.Tk):
                         skip_onboard = self._reg_skip_onboard.get()
                         use_roxy = self._reg_use_roxy.get()
 
+                        # Log cache status
+                        if cached_email:
+                            self._reg_queue.put((f"  Reusing cached email: {cached_email}", "info"))
+                        if cached_device_code_data:
+                            expires_at = cached_device_code_data.get("expires_at", 0)
+                            remaining = max(0, expires_at - time.time())
+                            self._reg_queue.put((f"  Reusing cached device code (expires in {int(remaining)}s)", "info"))
+
                         result = loop.run_until_complete(
-                            self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy)
+                            self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy,
+                                                cached_email=cached_email, cached_device_code_data=cached_device_code_data)
                         )
 
                         if result and result.get("email"):
+                            # Cache email AND device code for next retry
+                            cached_email = result.get("email")
+                            cached_device_code_data = result.get("device_code_info")
+
+                            if cached_email:
+                                self._reg_queue.put((f"ℹ️  Email cached: {cached_email}", "info"))
+
+                            if cached_device_code_data:
+                                expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
+                                remaining = max(0, int(expires_at_timestamp - time.time()))
+                                self._reg_queue.put((f"ℹ️  Device code cached (expires in {remaining}s)", "info"))
+
+                                # Check if expired - clear cache if so
+                                if remaining <= 0:
+                                    self._reg_queue.put(("⚠️  Device code expired, clearing cache", "warn"))
+                                    cached_email = None
+                                    cached_device_code_data = None
+
                             # Check if incomplete (TES block, export failure, etc.)
                             is_incomplete = result.get("incomplete", False)
                             if is_incomplete:
@@ -2100,6 +2131,10 @@ class App(tk.Tk):
 
                     self._reg_queue.put((f"\n[Batch #{batch_num}, Account {i}/{batch_count}] Starting registration...", "info"))
 
+                    # Cache for retry persistence (per account scope)
+                    cached_email = None
+                    cached_device_code_data = None
+
                     # Retry loop per account
                     MAX_RETRY = 3
                     account_success = False
@@ -2121,11 +2156,38 @@ class App(tk.Tk):
                             skip_onboard = self._reg_skip_onboard.get()
                             use_roxy = self._reg_use_roxy.get()
 
+                            # Log cache status
+                            if cached_email:
+                                self._reg_queue.put((f"  Reusing cached email: {cached_email}", "info"))
+                            if cached_device_code_data:
+                                expires_at = cached_device_code_data.get("expires_at", 0)
+                                remaining = max(0, expires_at - time.time())
+                                self._reg_queue.put((f"  Reusing cached device code (expires in {int(remaining)}s)", "info"))
+
                             result = loop.run_until_complete(
-                                self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy)
+                                self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy,
+                                                    cached_email=cached_email, cached_device_code_data=cached_device_code_data)
                             )
 
                             if result and result.get("email"):
+                                # Cache email AND device code for next retry
+                                cached_email = result.get("email")
+                                cached_device_code_data = result.get("device_code_info")
+
+                                if cached_email:
+                                    self._reg_queue.put((f"ℹ️  Email cached: {cached_email}", "info"))
+
+                                if cached_device_code_data:
+                                    expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
+                                    remaining = max(0, int(expires_at_timestamp - time.time()))
+                                    self._reg_queue.put((f"ℹ️  Device code cached (expires in {remaining}s)", "info"))
+
+                                    # Check if expired - clear cache if so
+                                    if remaining <= 0:
+                                        self._reg_queue.put(("⚠️  Device code expired, clearing cache", "warn"))
+                                        cached_email = None
+                                        cached_device_code_data = None
+
                                 # Check if incomplete (TES block, export failure, etc.)
                                 is_incomplete = result.get("incomplete", False)
                                 if is_incomplete:
@@ -2251,7 +2313,7 @@ class App(tk.Tk):
         }
         db_upsert_account(self.conn, account_data)
 
-    async def _reg_async_main(self, headless=True, auto_login=True, skip_onboard=True, use_roxy=False):
+    async def _reg_async_main(self, headless=True, auto_login=True, skip_onboard=True, use_roxy=False, cached_email=None, cached_device_code_data=None):
         """Drives the full registration flow via the kiro_register or roxy_register module"""
         from mail_providers import get_provider
         mail_url = self._reg_mail_url.get().strip() or None
@@ -2329,6 +2391,8 @@ class App(tk.Tk):
                     proxy_url=proxy_url,
                     log=self._reg_log,
                     cancel_check=lambda: self._reg_cancel,
+                    cached_email=cached_email,
+                    cached_device_code_data=cached_device_code_data
                 )
 
                 # Update cached auth token in config if refreshed

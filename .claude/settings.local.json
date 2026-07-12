@@ -10,7 +10,9 @@
       "Bash(chmod +x *)",
       "Bash(Get-ChildItem -Filter \"*.py\" -Recurse)",
       "Bash(Select-String -Pattern \"from.*kiro_register|import.*kiro_register\")",
-      "Bash(Select-Object -ExpandProperty Path -Unique)"
+      "Bash(Select-Object -ExpandProperty Path -Unique)",
+      "Bash(python -m py_compile mail_providers/gsuite_imap.py)",
+      "Bash(python *)"
     ],
     "allowed": [
       "python *",
