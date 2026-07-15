@@ -3501,3 +3501,4 @@ kiro_config.json
 /.venv-windows/Scripts/Activate.ps1
 /.venv-windows/Scripts/deactivate.bat
 /.venv-windows/pyvenv.cfg
+/.env

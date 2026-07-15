@@ -1,583 +1,425 @@
-"""
-K.I.R.O Register - Batch/Service Mode
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Headless K.I.R.O registration service for Docker / Dokploy.
 
-Headless runner for automated AWS Builder ID registration.
-Supports batch mode (X accounts) and service mode (infinite loop).
-
-Usage:
-    python service.py --batch 10            # 10 accounts then stop
-    python service.py --service             # Infinite loop until Ctrl+C
-    python service.py --batch 50 --delay 30 # 50 accounts, 30s delay
+All runtime settings can be supplied via environment variables or a mounted
+`kiro_config.json`. Sensitive values (passwords, API keys) should be set in
+Dokploy's "Environment" tab, not committed to the image.
 """
+from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import sys
-import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-# Database configuration
-DB_PATH = Path(os.getenv("DB_PATH", "kiro_accounts.db"))
-
-DB_SCHEMA = """
-CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE NOT NULL,
-    password TEXT DEFAULT '',
-    provider TEXT DEFAULT '',
-    authMethod TEXT DEFAULT '',
-    accessToken TEXT,
-    refreshToken TEXT,
-    expiresAt TEXT,
-    clientId TEXT,
-    clientSecret TEXT,
-    clientIdHash TEXT,
-    region TEXT DEFAULT 'us-east-1',
-    profileArn TEXT,
-    userId TEXT,
-    usageLimit INTEGER DEFAULT 0,
-    currentUsage INTEGER DEFAULT 0,
-    overageCap INTEGER DEFAULT 0,
-    currentOverages INTEGER DEFAULT 0,
-    overageStatus TEXT,
-    overageCharges REAL DEFAULT 0.0,
-    subscription TEXT DEFAULT '',
-    lastQueryTime TEXT,
-    createdAt TEXT DEFAULT (datetime('now','localtime')),
-    updatedAt TEXT DEFAULT (datetime('now','localtime'))
-);
-"""
-
-
-def get_db():
-    """Initialize database connection and schema"""
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(DB_SCHEMA)
-    # Migration: add subscription/password columns if missing
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()]
-    if "subscription" not in cols:
-        conn.execute("ALTER TABLE accounts ADD COLUMN subscription TEXT DEFAULT ''")
-    if "password" not in cols:
-        conn.execute("ALTER TABLE accounts ADD COLUMN password TEXT DEFAULT ''")
-    conn.commit()
-    return conn
-
-
-def save_account(result: dict):
-    """Save successful registration to database"""
+# Load .env file if present (local development / Dokploy bind mount).
+def _load_dotenv():
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
     try:
-        conn = get_db()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        from dotenv import load_dotenv  # type: ignore
 
-        email = result.get("email")
-        if not email:
-            print("⚠️  No email in result, skipping DB save")
-            return
+        load_dotenv(dotenv_path=env_path)
+    except Exception:
+        # Minimal fallback if python-dotenv is not installed.
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = value
 
-        # Check if exists
-        existing = conn.execute("SELECT id FROM accounts WHERE email=?", (email,)).fetchone()
+_load_dotenv()
 
-        if existing:
-            print(f"ℹ️  Account already exists in DB: {email}")
-            conn.close()
-            return
+import kiro_register
+import mail_providers
 
-        # Insert new account
-        conn.execute("""
-            INSERT INTO accounts (
-                email, provider, authMethod, accessToken, refreshToken,
-                expiresAt, clientId, clientSecret, clientIdHash, region,
-                profileArn, userId, subscription, updatedAt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            email,
-            result.get("provider", "aws"),
-            result.get("authMethod", "oauth"),
-            result.get("accessToken", ""),
-            result.get("refreshToken", ""),
-            result.get("expiresAt", ""),
-            result.get("clientId", ""),
-            result.get("clientSecret", ""),
-            result.get("clientIdHash", ""),
-            result.get("region", "us-east-1"),
-            result.get("profileArn", ""),
-            result.get("userId", ""),
-            result.get("subscription", ""),
-            now
-        ))
+logger = logging.getLogger("kiro-service")
 
-        conn.commit()
-        conn.close()
-        print(f"✓ Saved to database: {DB_PATH}")
+DEFAULT_CFG = {
+    "mail_provider": "gsuite_imap",
+    "imap_server": "imap.gmail.com",
+    "imap_port": 993,
+    "imap_user": "",
+    "imap_pass": "",
+    "imap_folder": "INBOX",
+    "imap_domains_file": "domains.txt",
+    "captcha_provider": "multibot",
+    "router9_url": "",
+    "router9_password": "",
+    "router9_auth_token": "",
+    "router9_auth_token_expires_at": "",
+    "proxy_url": "",
+    "shiromail_base_url": "https://shiromail.galiais.com",
+    "shiromail_api_key": "",
+    "shiromail_domain_id": "",
+    "yydsmail_base_url": "",
+    "yydsmail_api_key": "",
+    "yydsmail_domain": "",
+    "yydsmail_subdomain": "",
+    "yydsmail_wildcard": False,
+}
 
-    except Exception as e:
-        print(f"⚠️  Failed to save to database: {e}")
-
-
-# Import registration functions
-try:
-    from kiro_register import register, register_via_9router_oauth
-    from mail_providers import get_provider as get_mail_provider, list_providers
-except ImportError as e:
-    print(f"❌ Import error: {e}")
-    print("ℹ️  Make sure you're running from the project root and dependencies are installed")
-    print("ℹ️  Try: pip install -r requirements.txt")
-    sys.exit(1)
-
-
-def load_config():
-    """Load configuration from kiro_config.json or CONFIG_PATH env var"""
-    config_path = Path(os.getenv("CONFIG_PATH", "kiro_config.json"))
-
-    # Generate default config from env vars if file doesn't exist
-    if not config_path.exists():
-        print(f"ℹ️  Config file not found: {config_path}")
-        print("ℹ️  Generating config from environment variables...")
-
-        config = {
-            "mail_provider": os.getenv("MAIL_PROVIDER", "gsuite_imap"),
-            "captcha_provider": os.getenv("CAPTCHA_PROVIDER", "multibot"),
-            "proxy_url": os.getenv("PROXY_URL", ""),
-            "router9_url": os.getenv("ROUTER9_URL", ""),
-            "router9_password": os.getenv("ROUTER9_PASSWORD", ""),
-        }
-
-        # Mail provider specific config
-        if config["mail_provider"] == "shiromail":
-            config["shiromail"] = {
-                "base_url": os.getenv("SHIROMAIL_BASE_URL", ""),
-                "api_key": os.getenv("SHIROMAIL_API_KEY", ""),
-                "domain_id": int(os.getenv("SHIROMAIL_DOMAIN_ID", "1"))
-            }
-        elif config["mail_provider"] == "yydsmail":
-            config["yydsmail"] = {
-                "base_url": os.getenv("YYDSMAIL_BASE_URL", ""),
-                "api_key": os.getenv("YYDSMAIL_API_KEY", "")
-            }
-        elif config["mail_provider"] == "gsuite_imap":
-            config["imap_server"] = os.getenv("IMAP_SERVER", "imap.gmail.com")
-            config["imap_port"] = os.getenv("IMAP_PORT", "993")
-            config["imap_user"] = os.getenv("IMAP_USER", "")
-            config["imap_pass"] = os.getenv("IMAP_PASS", "")
-            config["imap_domains_file"] = os.getenv("DOMAINS_PATH", "domains.txt")
-
-        # Captcha config
-        if config["captcha_provider"] == "yescaptcha":
-            config["yescaptcha_api_key"] = os.getenv("YESCAPTCHA_API_KEY", "")
-        elif config["captcha_provider"] == "multibot":
-            config["multibot_key"] = os.getenv("MULTIBOT_KEY", "")
-
-        # Save generated config
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-        print(f"✓ Generated config file: {config_path}")
-
-        return config
-
-    print(f"ℹ️  Loading configuration from {config_path}")
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    provider = config.get("mail_provider", "not set")
-    captcha = config.get("captcha_provider", "manual")
-    proxy = "configured" if config.get("proxy_url") else "none"
-    print(f"ℹ️  Mail provider: {provider}, Captcha: {captcha}, Proxy: {proxy}")
-
-    return config
+ENV_MAP = {
+    "MAIL_PROVIDER": "mail_provider",
+    "IMAP_SERVER": "imap_server",
+    "IMAP_PORT": "imap_port",
+    "IMAP_USER": "imap_user",
+    "IMAP_PASS": "imap_pass",
+    "IMAP_FOLDER": "imap_folder",
+    "IMAP_DOMAINS_FILE": "imap_domains_file",
+    "DOMAINS_PATH": "imap_domains_file",
+    "CAPTCHA_PROVIDER": "captcha_provider",
+    "SHIROMAIL_BASE_URL": "shiromail_base_url",
+    "SHIROMAIL_API_KEY": "shiromail_api_key",
+    "SHIROMAIL_DOMAIN_ID": "shiromail_domain_id",
+    "YYDSMAIL_BASE_URL": "yydsmail_base_url",
+    "YYDSMAIL_API_KEY": "yydsmail_api_key",
+    "YYDSMAIL_DOMAIN": "yydsmail_domain",
+    "YYDSMAIL_SUBDOMAIN": "yydsmail_subdomain",
+    "ROUTER9_URL": "router9_url",
+    "ROUTER9_PASSWORD": "router9_password",
+    "ROUTER9_AUTH_TOKEN": "router9_auth_token",
+    "ROUTER9_AUTH_TOKEN_EXPIRES_AT": "router9_auth_token_expires_at",
+    "PROXY_URL": "proxy_url",
+}
 
 
-def get_mail_provider_instance(config):
-    """Initialize mail provider from config with env var fallback."""
-    import os
-
-    provider_name = config.get("mail_provider", "shiromail")
-    print(f"ℹ️  Initializing mail provider: {provider_name}")
-
-    # Get provider config
-    if provider_name == "shiromail":
-        provider_config = config.get("shiromail", {})
-    elif provider_name == "yydsmail":
-        provider_config = config.get("yydsmail", {})
-    elif provider_name == "gsuite_imap":
-        # Check both nested and flat config structure
-        provider_config = config.get("gsuite_imap", {})
-
-        # Fallback to flat config (root level keys)
-        if not provider_config:
-            provider_config = {
-                "imap_user": config.get("imap_user", ""),
-                "imap_pass": config.get("imap_pass", ""),
-                "imap_server": config.get("imap_server", "imap.gmail.com"),
-                "imap_port": int(config.get("imap_port", 993)),
-                "local_prefix": config.get("imap_local_prefix", "aws"),
-                "local_length": int(config.get("imap_local_length", 10)),
-            }
-
-        # Env var fallback
-        provider_config.setdefault("imap_user", os.getenv("GSUITE_IMAP_EMAIL", ""))
-        provider_config.setdefault("imap_pass", os.getenv("GSUITE_IMAP_PASSWORD", ""))
-        provider_config.setdefault("imap_server", os.getenv("GSUITE_IMAP_SERVER", "imap.gmail.com"))
-        provider_config.setdefault("imap_port", int(os.getenv("GSUITE_IMAP_PORT", "993")))
-
-        user = provider_config.get("imap_user", "")
-        has_pass = bool(provider_config.get("imap_pass"))
-        print(f"ℹ️  IMAP credentials: user={user}, pass={'***' if has_pass else 'MISSING'}")
-    else:
-        print(f"❌ Unknown mail provider: {provider_name}")
-        print(f"ℹ️  Available providers: shiromail, yydsmail, gsuite_imap")
-        return None
-
-    try:
-        print(f"ℹ️  Connecting to {provider_name} service...")
-        result = get_mail_provider(provider_name, **provider_config)
-        print(f"✅ Mail provider initialized successfully")
-        return result
-    except Exception as e:
-        print(f"❌ Failed to initialize mail provider: {e}")
-        print(f"ℹ️  Check your API keys and credentials in kiro_config.json")
-        return None
+def _env_bool(value) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def register_one_account(config, use_9router, headless):
-    """Register a single account with retry logic (fresh email, reuse device_code)."""
-    mail_provider = get_mail_provider_instance(config)
-    if not mail_provider:
-        print("❌ Failed to initialize mail provider")
-        return None
+def _resolve_domains_path(cfg: dict, config_path: Path) -> Path:
+    raw = cfg.get("imap_domains_file") or os.environ.get("DOMAINS_PATH") or "domains.txt"
+    p = Path(raw)
+    if not p.is_absolute():
+        base = config_path.parent if config_path else Path.cwd()
+        p = base / p
+    return p
 
-    # Cache device_code only (not email)
-    cached_device_code_data = None
 
-    MAX_RETRY = 3
-    for attempt in range(1, MAX_RETRY + 1):
-        print(f"\n{'='*60}")
-        print(f"🔄 Registration attempt {attempt}/{MAX_RETRY} (fresh email)")
-        print(f"{'='*60}")
-
+def load_configuration() -> tuple[dict, Path]:
+    config_path = Path(os.environ.get("CONFIG_PATH", "/config/kiro_config.json"))
+    cfg = dict(DEFAULT_CFG)
+    if config_path.exists():
         try:
-            if use_9router:
-                # Transform flat config to nested structure
-                router9_config = {
-                    "base_url": config.get("router9_url"),
-                    "password": config.get("router9_password"),
-                    "auth_token": config.get("router9_auth_token"),
-                    "auth_token_expires_at": config.get("router9_auth_token_expires_at")
-                }
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg.update(data)
+        except Exception as exc:
+            logger.warning("Failed to read %s: %s", config_path, exc)
 
-                if not router9_config.get("base_url") or not router9_config.get("password"):
-                    print("❌ 9router config incomplete: missing base_url or password")
-                    print("ℹ️  Add 'router9_url' and 'router9_password' to kiro_config.json")
-                    return None
+    for env_key, cfg_key in ENV_MAP.items():
+        val = os.environ.get(env_key)
+        if val is not None:
+            cfg[cfg_key] = val
 
-                print("ℹ️  Using 9router OAuth device code flow...")
-                if cached_device_code_data:
-                    expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
-                    remaining = max(0, int(expires_at_timestamp - time.time()))
-                    if remaining > 250:
-                        print(f"ℹ️  Reusing cached device code (expires in {remaining}s)")
-                    else:
-                        print("⚠️  Cached device code expired, generating fresh one")
-                        cached_device_code_data = None
+    domains_env = os.environ.get("DOMAINS", "").strip()
+    domain_list: list[str] = []
+    if domains_env:
+        domain_list = [d.strip() for d in domains_env.split(",") if d.strip()]
+        domains_path = _resolve_domains_path(cfg, config_path)
+        try:
+            domains_path.parent.mkdir(parents=True, exist_ok=True)
+            domains_path.write_text("\n".join(domain_list) + "\n", encoding="utf-8")
+        except OSError:
+            # Config volume may be mounted read-only; the provider still receives the list.
+            pass
+    elif config_path.exists():
+        domains_path = _resolve_domains_path(cfg, config_path)
+        if domains_path.exists():
+            try:
+                domain_list = [
+                    line.strip()
+                    for line in domains_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+            except Exception:
+                pass
 
-                result = asyncio.run(register_via_9router_oauth(
-                    mail_provider_instance=mail_provider,
-                    router9_config=router9_config,
-                    headless=headless,
-                    proxy_url=config.get("proxy_url"),
-                    auto_login=True,
-                    skip_onboard=True,
-                    cancel_check=None,
-                    cached_email=None,  # Always fresh
-                    cached_device_code_data=cached_device_code_data
-                ))
-            else:
-                print("ℹ️  Using standard registration flow...")
-                result = asyncio.run(register(
-                    mail_provider_instance=mail_provider,
-                    headless=headless,
-                    proxy_url=config.get("proxy_url"),
-                    auto_login=True,
-                    skip_onboard=True,
-                    cancel_check=None
-                ))
-
-            if result and result.get("email"):
-                # Cache device_code for next retry (but not email)
-                cached_device_code_data = result.get("device_code_info")
-
-                # Check if incomplete (TES block, export failure, etc.)
-                is_incomplete = result.get("incomplete", False)
-                if is_incomplete:
-                    fail_reason = result.get("failReason", "Unknown")
-                    print(f"❌ Registration incomplete: {fail_reason}")
-
-                    if "TES" in fail_reason or "Blocked" in fail_reason:
-                        print("⚠️  AWS Trust Evaluation Service (TES) block detected")
-                        print("ℹ️  Consider using residential proxy or reducing velocity")
-
-                    if "device code" in fail_reason.lower() and "expired" in fail_reason.lower():
-                        print("⚠️  9router device code expired - re-authentication needed")
-                        cached_device_code_data = None  # Clear expired device code
-
-                    if attempt < MAX_RETRY:
-                        # TES blocks need longer cooling (synced with main.py)
-                        is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
-                        retry_delay = (10 + (attempt * 20)) if is_tes_block else (5 + (attempt * 3))
-                        print(f"⏳ Waiting {retry_delay}s before retry with fresh email (reason: {'TES cooldown' if is_tes_block else 'standard backoff'})...")
-                        time.sleep(retry_delay)
-                    continue
-
-                # Success - account complete and healthy
-                email = result["email"]
-                exported = result.get("router9_exported", False)
-                print(f"✅ Registration successful!")
-                print(f"   Email: {email}")
-                if use_9router:
-                    export_status = 'Yes ✅' if exported else 'No ⚠️'
-                    print(f"   Exported to 9router: {export_status}")
-
-                # Save to database
-                save_account(result)
-
-                return result
-            else:
-                # No result or no email
-                print(f"❌ Registration failed: No result returned from registration flow")
-                if attempt < MAX_RETRY:
-                    print(f"⏳ Waiting 5s before retry (attempt {attempt + 1}/{MAX_RETRY})...")
-                    time.sleep(5)
-
-        except Exception as e:
-            print(f"❌ Registration error: {e}")
-            import traceback
-            print(f"ℹ️  Stack trace: {traceback.format_exc()}")
-            if attempt < MAX_RETRY:
-                print(f"⏳ Waiting 5s before retry (attempt {attempt + 1}/{MAX_RETRY})...")
-                time.sleep(5)
-
-    # All retries exhausted
-    print(f"❌ Registration failed after {MAX_RETRY} attempts")
-    print(f"ℹ️  Check config, proxy settings, and try again later")
-    return None
+    cfg["domains"] = domain_list
+    return cfg, config_path
 
 
-def print_stats(mode, target, successful, failed, total):
-    """Print statistics summary."""
-    print("\n" + "=" * 70)
-    print(f"  {mode} COMPLETE")
-    print("=" * 70)
-    if target:
-        print(f"  Target: {target}")
-    print(f"  Total: {total}")
-    print(f"  ✅ Success: {successful}")
-    print(f"  ❌ Failed: {failed}")
-    print(f"  Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
+def build_mail_provider(cfg: dict, config_path: Path):
+    name = str(cfg.get("mail_provider", "gsuite_imap")).strip().lower()
+    domain_list = cfg.get("domains") or []
+
+    if name == "gsuite_imap":
+        port = cfg.get("imap_port", 993)
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            port = 993
+        domains_path = _resolve_domains_path(cfg, config_path)
+        return mail_providers.GsuiteImapProvider(
+            imap_server=cfg.get("imap_server", "imap.gmail.com"),
+            imap_port=port,
+            imap_user=cfg.get("imap_user", ""),
+            imap_pass=cfg.get("imap_pass", ""),
+            imap_folder=cfg.get("imap_folder", "INBOX"),
+            domains=domain_list or None,
+            domains_file=str(domains_path) if domains_path.exists() and not domain_list else None,
+            local_length=10,
+        )
+
+    if name == "shiromail":
+        did = cfg.get("shiromail_domain_id", "")
+        try:
+            did = int(did)
+        except (TypeError, ValueError):
+            did = 0
+        return mail_providers.ShiroMailProvider(
+            base_url=cfg.get("shiromail_base_url", ""),
+            api_key=cfg.get("shiromail_api_key", ""),
+            domain_id=did,
+        )
+
+    if name == "yydsmail":
+        return mail_providers.YydsMailProvider(
+            api_key=cfg.get("yydsmail_api_key", ""),
+            base_url=cfg.get("yydsmail_base_url", ""),
+            domain=cfg.get("yydsmail_domain", ""),
+            subdomain=cfg.get("yydsmail_subdomain", ""),
+            wildcard=_env_bool(cfg.get("yydsmail_wildcard", False)),
+        )
+
+    raise ValueError(f"Unknown mail provider: {name}")
 
 
-def run_batch(count, delay, use_9router, headless):
-    """Batch mode - register N accounts then stop."""
-    config = load_config()
-
-    print("\n" + "=" * 70)
-    print("  K.I.R.O BATCH MODE")
-    print("=" * 70)
-    print(f"  Target: {count} accounts")
-    print(f"  Delay: {delay}s")
-    print(f"  Flow: {'9router OAuth' if use_9router else 'Standard'}")
-    print(f"  Browser: {'Headless' if headless else 'Headed'}")
-    print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
-
-    successful = 0
-    failed = 0
-
-    for i in range(1, count + 1):
-        print(f"\n{'='*60}")
-        print(f"[{i}/{count}] Starting registration...")
-        print(f"{'='*60}")
-
-        result = register_one_account(config, use_9router, headless)
-
-        if result:
-            successful += 1
-            print(f"\n✅ Account {i}/{count} registered successfully")
-        else:
-            failed += 1
-            print(f"\n❌ Account {i}/{count} registration failed")
-
-        if i < count:
-            print(f"\n⏳ Waiting {delay}s before next registration...")
-            time.sleep(delay)
-
-    print_stats("BATCH", count, successful, failed, count)
+def log_callback(msg, level="info"):
+    lvl = str(level).lower()
+    if lvl in ("err", "error", "fail", "critical"):
+        logger.error(msg)
+    elif lvl in ("warn", "warning"):
+        logger.warning(msg)
+    elif lvl in ("ok", "success"):
+        logger.info("[ok] %s", msg)
+    else:
+        logger.info(msg)
 
 
-def run_service(delay, use_9router, headless):
-    """Service mode - infinite loop until Ctrl+C."""
-    config = load_config()
-
-    print("\n" + "=" * 70)
-    print("  K.I.R.O SERVICE MODE")
-    print("=" * 70)
-    print(f"  Mode: Continuous (Ctrl+C to stop)")
-    print(f"  Delay: {delay}s")
-    print(f"  Flow: {'9router OAuth' if use_9router else 'Standard'}")
-    print(f"  Browser: {'Headless' if headless else 'Headed'}")
-    print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
-
-    successful = 0
-    failed = 0
-    total = 0
-
-    try:
-        while True:
-            total += 1
-            print(f"\n{'='*60}")
-            print(f"[Account #{total}] Starting registration...")
-            print(f"Progress: ✅ {successful} | ❌ {failed}")
-            print(f"{'='*60}")
-
-            result = register_one_account(config, use_9router, headless)
-
-            if result:
-                successful += 1
-                print(f"\n✅ Account #{total} registered successfully")
-            else:
-                failed += 1
-                print(f"\n❌ Account #{total} registration failed")
-
-            print(f"\n⏳ Waiting {delay}s before next registration...")
-            time.sleep(delay)
-            print_stats("SERVICE", None, successful, failed, total)
-
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Service mode stopped by user (Ctrl+C)")
-        print(f"ℹ️  Final statistics:")
-        print_stats("SERVICE", None, successful, failed, total)
+def _db_path() -> Path | None:
+    raw = os.environ.get("DB_PATH", "/data/accounts.db")
+    if not raw:
+        return None
+    return Path(raw)
 
 
-def run_batch_loop(count, account_delay, batch_delay, use_9router, headless):
-    """Batch loop mode - register N accounts per batch, wait, repeat infinitely."""
-    config = load_config()
-
-    print("\n" + "=" * 70)
-    print("  K.I.R.O BATCH LOOP MODE")
-    print("=" * 70)
-    print(f"  Accounts per batch: {count}")
-    print(f"  Account delay: {account_delay}s")
-    print(f"  Batch delay: {batch_delay}s")
-    print(f"  Flow: {'9router OAuth' if use_9router else 'Standard'}")
-    print(f"  Browser: {'Headless' if headless else 'Headed'}")
-    print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
-
-    batch_num = 0
-    total_successful = 0
-    total_failed = 0
-    total_accounts = 0
-
-    try:
-        while True:
-            batch_num += 1
-            batch_successful = 0
-            batch_failed = 0
-
-            print(f"\n{'=' * 70}")
-            print(f"  BATCH #{batch_num}")
-            print(f"{'=' * 70}")
-
-            for i in range(1, count + 1):
-                total_accounts += 1
-                print(f"\n{'='*60}")
-                print(f"[Batch {batch_num}, Account {i}/{count}] Starting registration...")
-                print(f"{'='*60}")
-
-                result = register_one_account(config, use_9router, headless)
-
-                if result:
-                    batch_successful += 1
-                    total_successful += 1
-                    print(f"\n✅ Batch {batch_num}, Account {i}/{count} registered successfully")
-                else:
-                    batch_failed += 1
-                    total_failed += 1
-                    print(f"\n❌ Batch {batch_num}, Account {i}/{count} registration failed")
-
-                if i < count:
-                    print(f"\n⏳ Account delay {account_delay}s before next account...")
-                    time.sleep(account_delay)
-
-            print(f"\n{'='*60}")
-            print(f"✅ Batch #{batch_num} complete")
-            print(f"   Batch: ✅ {batch_successful} | ❌ {batch_failed}")
-            print(f"   Total: ✅ {total_successful} | ❌ {total_failed}")
-            print(f"{'='*60}")
-
-            print(f"\n⏳ Batch delay {batch_delay}s before next batch...")
-            time.sleep(batch_delay)
-
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Batch loop mode stopped by user (Ctrl+C)")
-        print_stats("BATCH LOOP", None, total_successful, total_failed, total_accounts)
-        print(f"  Total batches: {batch_num}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="K.I.R.O Register - Batch/Service Mode",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python service.py --batch 10
-  python service.py --service --delay 60
-  python service.py --batch-loop 5 --account-delay 10 --batch-delay 120
-  python service.py --batch 20 --9router --headed
+def init_db():
+    db = _db_path()
+    if not db:
+        return
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS service_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT,
+            password TEXT,
+            full_name TEXT,
+            provider TEXT,
+            auth_method TEXT,
+            region TEXT,
+            client_id TEXT,
+            client_secret TEXT,
+            access_token TEXT,
+            refresh_token TEXT,
+            expires_at TEXT,
+            incomplete INTEGER DEFAULT 0,
+            fail_reason TEXT,
+            router9_exported INTEGER DEFAULT 0,
+            created_at TEXT
+        )
         """
     )
+    conn.commit()
+    conn.close()
 
-    # Mode selection
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument("--batch", type=int, metavar="N",
-                            help="Batch mode: register N accounts then stop")
-    mode_group.add_argument("--service", action="store_true",
-                            help="Service mode: infinite loop until Ctrl+C")
-    mode_group.add_argument("--batch-loop", type=int, metavar="N",
-                            help="Batch loop mode: register N accounts per batch, repeat infinitely")
 
-    # Common options
-    parser.add_argument("--delay", type=int, default=10,
-                        help="Delay in seconds between accounts (default: 10)")
-    parser.add_argument("--account-delay", type=int, default=10,
-                        help="Delay between accounts in batch-loop mode (default: 10)")
-    parser.add_argument("--batch-delay", type=int, default=60,
-                        help="Delay between batches in batch-loop mode (default: 60)")
-    parser.add_argument("--9router", action="store_true",
-                        help="Use 9router OAuth flow instead of standard registration")
-    parser.add_argument("--headed", action="store_true",
-                        help="Run browser in headed mode (visible)")
+def persist_account(result: dict):
+    db = _db_path()
+    if not db:
+        return
+    try:
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            """
+            INSERT INTO service_accounts
+            (email, password, full_name, provider, auth_method, region, client_id,
+             client_secret, access_token, refresh_token, expires_at, incomplete,
+             fail_reason, router9_exported, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result.get("email"),
+                result.get("password"),
+                result.get("full_name"),
+                result.get("provider"),
+                result.get("authMethod"),
+                result.get("region"),
+                result.get("clientId"),
+                result.get("clientSecret"),
+                result.get("accessToken"),
+                result.get("refreshToken"),
+                result.get("expiresAt"),
+                1 if result.get("incomplete") else 0,
+                result.get("failReason", ""),
+                1 if result.get("router9_exported") else 0,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("Failed to persist account to DB")
 
-    args = parser.parse_args()
 
-    headless = not args.headed
-    use_9router = getattr(args, '9router')
+async def run_account(cfg: dict, config_path: Path, use_9router: bool, proxy_url: str, headless: bool):
+    provider = build_mail_provider(cfg, config_path)
 
-    # Run the selected mode
+    if use_9router:
+        router9_config = {
+            "base_url": cfg.get("router9_url", ""),
+            "password": cfg.get("router9_password", ""),
+            "auth_token": cfg.get("router9_auth_token", ""),
+            "auth_token_expires_at": cfg.get("router9_auth_token_expires_at", ""),
+        }
+        if not router9_config["base_url"] or not router9_config["password"]:
+            raise ValueError("router9_url and router9_password are required for --9router mode")
+        result = await kiro_register.register_via_9router_oauth(
+            headless=headless,
+            auto_login=True,
+            skip_onboard=True,
+            mail_provider_instance=provider,
+            router9_config=router9_config,
+            proxy_url=proxy_url,
+            log=log_callback,
+        )
+    else:
+        result = await kiro_register.register(
+            headless=headless,
+            auto_login=True,
+            skip_onboard=True,
+            mail_provider_instance=provider,
+            proxy_url=proxy_url,
+            log=log_callback,
+        )
+
+    incomplete = bool(result.get("incomplete"))
+    email = result.get("email", "N/A")
+    if incomplete:
+        logger.warning("Partial result for %s: %s", email, result.get("failReason"))
+    else:
+        logger.info("Success for %s", email)
+    persist_account(result)
+    return result
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="K.I.R.O registration service")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--service", action="store_true", help="Run forever, one account per cycle")
+    mode.add_argument("--batch", type=int, default=0, help="Register N accounts then exit")
+    mode.add_argument("--batch-loop", type=int, default=0, help="Register N accounts per batch, repeat forever")
+
+    parser.add_argument("--delay", type=int, default=int(os.environ.get("DELAY", "300")), help="Seconds between accounts")
+    parser.add_argument("--batch-delay", type=int, default=int(os.environ.get("BATCH_DELAY", "3600")), help="Seconds between batches in --batch-loop")
+    parser.add_argument("--headless", action="store_true", default=None, help="Run browser headless (default in containers)")
+    parser.add_argument("--no-headless", dest="headless", action="store_false", help="Show browser window")
+    parser.add_argument("--9router", "--nine-router", dest="nine_router", action="store_true", help="Use 9router OAuth device-code flow")
+    parser.add_argument("--proxy", default=os.environ.get("PROXY_URL", ""), help="Proxy URL, e.g. http://user:pass@host:port")
+    parser.add_argument("--provider", default=os.environ.get("MAIL_PROVIDER", ""), help="Mail provider: gsuite_imap | shiromail | yydsmail")
+    parser.add_argument("--config", default=os.environ.get("CONFIG_PATH", "/config/kiro_config.json"), help="Path to kiro_config.json")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
+    return parser.parse_args(argv)
+
+
+async def main():
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+
+    os.environ.setdefault("APPDATA", "/data")
+    if args.config:
+        os.environ["CONFIG_PATH"] = args.config
+    if args.provider:
+        os.environ["MAIL_PROVIDER"] = args.provider
+    if args.proxy:
+        os.environ["PROXY_URL"] = args.proxy
+
+    cfg, config_path = load_configuration()
+    logger.info("Config path: %s", config_path)
+    logger.info("Mail provider: %s", cfg.get("mail_provider"))
+    logger.info("DB path: %s", _db_path())
+
+    init_db()
+
+    # Gsuite/IMAP requires a non-empty domain pool; fail fast instead of looping on the same error.
+    if str(cfg.get("mail_provider", "")).strip().lower() == "gsuite_imap" and not cfg.get("domains"):
+        domains_path = _resolve_domains_path(cfg, config_path)
+        logger.error(
+            "Gsuite/IMAP provider has an empty domain pool. "
+            "Set DOMAINS=example.com,example.org or populate %s",
+            domains_path,
+        )
+        sys.exit(1)
+
+    if args.headless is None:
+        headless = os.environ.get("DISPLAY", "") == ""
+    else:
+        headless = args.headless
+
+    proxy_url = (args.proxy or cfg.get("proxy_url", "")).strip() or None
+
     if args.batch:
-        run_batch(args.batch, args.delay, use_9router, headless)
-    elif args.service:
-        run_service(args.delay, use_9router, headless)
+        count, loop_forever, inter_batch = args.batch, False, args.delay
     elif args.batch_loop:
-        run_batch_loop(args.batch_loop, args.account_delay, args.batch_delay, use_9router, headless)
+        count, loop_forever, inter_batch = args.batch_loop, True, args.batch_delay
+    elif args.service:
+        count, loop_forever, inter_batch = 1, True, args.delay
+    else:
+        count, loop_forever, inter_batch = 1, False, args.delay
+
+    batch_id = 0
+    while True:
+        batch_id += 1
+        logger.info("Starting batch %d with %d account(s)", batch_id, count)
+        for i in range(count):
+            try:
+                await run_account(cfg, config_path, args.nine_router, proxy_url, headless)
+            except Exception:
+                logger.exception("Account registration failed")
+            if i < count - 1:
+                logger.info("Waiting %ds before next account", args.delay)
+                await asyncio.sleep(args.delay)
+
+        if loop_forever:
+            logger.info("Batch %d done; sleeping %ds before next cycle", batch_id, inter_batch)
+            await asyncio.sleep(inter_batch)
+        else:
+            break
+
+    logger.info("Service finished")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        sys.exit(0)

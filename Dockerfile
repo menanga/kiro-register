@@ -1,32 +1,29 @@
-# K.I.R.O Register - Docker Image
+# syntax=docker/dockerfile:1
 FROM mcr.microsoft.com/playwright/python:v1.61.0-noble
 
-# Set working directory
 WORKDIR /app
 
-# Install Python dependencies
+# Install Python dependencies and ensure Chromium matches the Playwright version.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -m playwright install chromium
 
-# Copy project files
+# Copy project files.
 COPY . .
 
-# Create directories for config and data
+# Persistent directories for runtime config/data.
 RUN mkdir -p /data /config
 
-# Environment variables (can be overridden)
 ENV PYTHONUNBUFFERED=1 \
+    APPDATA=/data \
     CONFIG_PATH=/config/kiro_config.json \
     DOMAINS_PATH=/config/domains.txt \
     DB_PATH=/data/accounts.db
 
-# Volume mounts for persistent data
 VOLUME ["/data", "/config"]
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
 
-# Default command (service mode with 60s delay and 9router)
-# Override in Dokploy Command field with: python service.py --batch 10 --9router
-CMD ["python", "service.py", "--service", "--delay", "300", "--9router"]
+# Default: run one headless account every 5 minutes. Override in Dokploy's Command field.
+CMD ["python", "service.py", "--service", "--delay", "300", "--headless"]

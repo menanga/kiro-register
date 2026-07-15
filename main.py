@@ -28,6 +28,29 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
 
+# Load .env automatically so GUI users can set secrets without exporting manually.
+def _load_dotenv():
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv  # type: ignore[import]
+
+        load_dotenv(dotenv_path=env_path)
+    except Exception:
+        # Minimal fallback if python-dotenv is not installed.
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
+
 # When running as PyInstaller bundle, configure paths for bundled dependencies
 if getattr(sys, 'frozen', False):
     _bundle_dir = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(sys.executable).parent
@@ -68,10 +91,9 @@ KIRO_CACHE_DIR = Path.home() / ".aws" / "sso" / "cache"
 
 # ─── Registration Constants ─────────────────────────────────────────────────
 
-SHIROMAIL_BASE = "https://shiromail.galiais.com"
-SHIROMAIL_KEY = "sk_live_3fgiWLXZuS3dalfbGJV-uFgV"
-SHIROMAIL_DOMAIN_ID = 4
-
+SHIROMAIL_BASE = os.environ.get("SHIROMAIL_BASE_URL", "https://shiromail.galiais.com")
+SHIROMAIL_KEY = os.environ.get("SHIROMAIL_API_KEY", "")
+SHIROMAIL_DOMAIN_ID = int(os.environ.get("SHIROMAIL_DOMAIN_ID", "4") or "4")
 REG_OIDC = "https://oidc.us-east-1.amazonaws.com"
 REG_SCOPES = [
     "codewhisperer:completions", "codewhisperer:analysis",
@@ -93,8 +115,8 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = Path(__file__).parent
 
-DB_PATH = APP_DIR / "kiro_accounts.db"
-CONFIG_PATH = APP_DIR / "kiro_config.json"
+DB_PATH = Path(os.environ.get("DB_PATH", str(APP_DIR / "kiro_accounts.db")))
+CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", str(APP_DIR / "kiro_config.json")))
 
 
 def load_config():
@@ -1186,6 +1208,7 @@ class App(tk.Tk):
         self._reg_import_no_trial = tk.BooleanVar(value=False)
         self._reg_use_roxy = tk.BooleanVar(value=False)
         self._use_9router_flow = tk.BooleanVar(value=False)
+        self._reg_concurrency = tk.IntVar(value=1)
 
         ttk.Checkbutton(opts_frame, text="Headless", variable=self._reg_headless).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts_frame, text="Auto sign-in", variable=self._reg_auto_login).pack(side="left", padx=(0, 12))

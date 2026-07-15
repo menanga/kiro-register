@@ -3,16 +3,25 @@ services:
     build: .
     container_name: kiro-register-service
     volumes:
-      # Mount config and data directory
-      - ./:/app
-      - kiro-data:/data
+      - ./config:/config:ro
+      - ./data:/data
     environment:
       - PYTHONUNBUFFERED=1
-    # Override command with your desired options
-    command: python service.py --batch-loop 10 --delay 600 --batch-delay 3600 --headless --9router
-    # Uncomment for interactive mode
-    # stdin_open: true
-    # tty: true
+      - CONFIG_PATH=/config/kiro_config.json
+      - DOMAINS_PATH=/config/domains.txt
+      - DB_PATH=/data/accounts.db
+      # Override mail provider with env so nothing secret is baked into the image:
+      # - MAIL_PROVIDER=gsuite_imap
+      # - IMAP_USER=user@gmail.com
+      # - IMAP_PASS=app_password
+      # - DOMAINS=example.com,example.net
+      # - CAPTCHA_PROVIDER=multibot
+      # - MULTIBOT_API_KEY=xxx
+      # - ROUTER9_URL=https://oapi.fastev.my.id
+      # - ROUTER9_PASSWORD=xxx
+    # Default loop: one account every 5 minutes (headless).
+    command: >
+      python service.py --service --delay 300 --headless
 
 volumes:
   kiro-data:
@@ -23,14 +32,11 @@ volumes:
 # Build image:
 #   docker-compose build
 #
-# Run batch mode (10 accounts, 5min delay):
-#   docker-compose run --rm kiro-service python service.py --batch 10 --delay 300 --headless --9router
+# Run a one-off batch of 10 accounts:
+#   docker-compose run --rm kiro-service python service.py --batch 10 --delay 300 --headless
 #
-# Run service mode (infinite):
-#   docker-compose run --rm kiro-service python service.py --service --delay 300 --headless --9router
+# Run service mode:
+#   docker-compose run --rm kiro-service python service.py --service --delay 300 --headless
 #
-# Run batch-loop mode (10 accounts per batch, 5min between accounts, 1hr between batches):
-#   docker-compose run --rm kiro-service python service.py --batch-loop 10 --delay 300 --batch-delay 3600 --headless --9router
-#
-# Interactive shell:
-#   docker-compose run --rm kiro-service bash
+# Run batch-loop mode (10 per batch, 1 hour between batches):
+#   docker-compose run --rm kiro-service python service.py --batch-loop 10 --delay 300 --batch-delay 3600 --headless

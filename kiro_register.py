@@ -26,9 +26,9 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 # --- Constants ---------------------------------------------------------------
 
-SHIROMAIL_BASE = ""
-SHIROMAIL_KEY = ""
-SHIROMAIL_DOMAIN_ID = 0
+SHIROMAIL_BASE = os.environ.get("SHIROMAIL_BASE_URL", "")
+SHIROMAIL_KEY = os.environ.get("SHIROMAIL_API_KEY", "")
+SHIROMAIL_DOMAIN_ID = int(os.environ.get("SHIROMAIL_DOMAIN_ID", "0") or "0")
 
 REG_OIDC = "https://oidc.us-east-1.amazonaws.com"
 REG_SCOPES = [
