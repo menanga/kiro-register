@@ -14,32 +14,12 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-
-# Load .env file if present (local development / Dokploy bind mount).
-def _load_dotenv():
-    env_path = Path(__file__).with_name(".env")
-    if not env_path.exists():
-        return
-    try:
-        from dotenv import load_dotenv  # type: ignore
-
-        load_dotenv(dotenv_path=env_path)
-    except Exception:
-        # Minimal fallback if python-dotenv is not installed.
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"')
-            if key and key not in os.environ:
-                os.environ[key] = value
-
-_load_dotenv()
+from urllib.parse import urlparse
 
 import kiro_register
 import mail_providers
@@ -93,6 +73,30 @@ ENV_MAP = {
     "ROUTER9_AUTH_TOKEN_EXPIRES_AT": "router9_auth_token_expires_at",
     "PROXY_URL": "proxy_url",
 }
+
+
+def _load_dotenv():
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv  # type: ignore[import]
+
+        load_dotenv(dotenv_path=env_path)
+    except Exception:
+        # Minimal fallback if python-dotenv is not installed.
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"\'')
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv()
 
 
 def _env_bool(value) -> bool:
@@ -149,6 +153,45 @@ def load_configuration() -> tuple[dict, Path]:
 
     cfg["domains"] = domain_list
     return cfg, config_path
+
+
+def _validate_proxy_url(url: str) -> str | None:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https", "socks5", "socks5h"}:
+            raise ValueError(f"unsupported scheme {parsed.scheme!r}")
+        if not parsed.hostname:
+            raise ValueError("missing hostname")
+        if parsed.port is None or not (1 <= parsed.port <= 65535):
+            raise ValueError(f"invalid port {parsed.port!r}")
+    except Exception as exc:
+        logger.warning("Ignoring invalid PROXY_URL %r: %s", url, exc)
+        return None
+    return url
+
+
+def _start_xvfb_if_needed(headless: bool) -> subprocess.Popen | None:
+    """Start an in-container Xvfb display when running a headed browser in Docker."""
+    if headless:
+        return None
+    if os.environ.get("DISPLAY"):
+        return None
+    try:
+        proc = subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Give Xvfb a moment to come up before Playwright tries to use it.
+        time.sleep(0.8)
+        os.environ["DISPLAY"] = ":99"
+        logger.info("Started Xvfb on DISPLAY :99 for headed browser")
+        return proc
+    except Exception as exc:
+        logger.warning("Could not start Xvfb for headed browser: %s", exc)
+        return None
 
 
 def build_mail_provider(cfg: dict, config_path: Path):
@@ -369,7 +412,14 @@ async def main():
 
     init_db()
 
-    # Gsuite/IMAP requires a non-empty domain pool; fail fast instead of looping on the same error.
+    if args.headless is None:
+        headless = os.environ.get("DISPLAY", "") == ""
+    else:
+        headless = args.headless
+
+    proxy_url = _validate_proxy_url((args.proxy or cfg.get("proxy_url", "")).strip())
+    xvfb_proc = _start_xvfb_if_needed(headless)
+
     if str(cfg.get("mail_provider", "")).strip().lower() == "gsuite_imap" and not cfg.get("domains"):
         domains_path = _resolve_domains_path(cfg, config_path)
         logger.error(
@@ -378,13 +428,6 @@ async def main():
             domains_path,
         )
         sys.exit(1)
-
-    if args.headless is None:
-        headless = os.environ.get("DISPLAY", "") == ""
-    else:
-        headless = args.headless
-
-    proxy_url = (args.proxy or cfg.get("proxy_url", "")).strip() or None
 
     if args.batch:
         count, loop_forever, inter_batch = args.batch, False, args.delay
@@ -395,24 +438,32 @@ async def main():
     else:
         count, loop_forever, inter_batch = 1, False, args.delay
 
-    batch_id = 0
-    while True:
-        batch_id += 1
-        logger.info("Starting batch %d with %d account(s)", batch_id, count)
-        for i in range(count):
-            try:
-                await run_account(cfg, config_path, args.nine_router, proxy_url, headless)
-            except Exception:
-                logger.exception("Account registration failed")
-            if i < count - 1:
-                logger.info("Waiting %ds before next account", args.delay)
-                await asyncio.sleep(args.delay)
+    try:
+        batch_id = 0
+        while True:
+            batch_id += 1
+            logger.info("Starting batch %d with %d account(s)", batch_id, count)
+            for i in range(count):
+                try:
+                    await run_account(cfg, config_path, args.nine_router, proxy_url, headless)
+                except Exception:
+                    logger.exception("Account registration failed")
+                if i < count - 1:
+                    logger.info("Waiting %ds before next account", args.delay)
+                    await asyncio.sleep(args.delay)
 
-        if loop_forever:
-            logger.info("Batch %d done; sleeping %ds before next cycle", batch_id, inter_batch)
-            await asyncio.sleep(inter_batch)
-        else:
-            break
+            if loop_forever:
+                logger.info("Batch %d done; sleeping %ds before next cycle", batch_id, inter_batch)
+                await asyncio.sleep(inter_batch)
+            else:
+                break
+    finally:
+        if xvfb_proc is not None:
+            try:
+                xvfb_proc.terminate()
+                xvfb_proc.wait(timeout=5)
+            except Exception:
+                xvfb_proc.kill()
 
     logger.info("Service finished")
 
