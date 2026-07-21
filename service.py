@@ -30,6 +30,14 @@ logger = logging.getLogger("kiro-service")
 # Global proxy pool instance
 _proxy_pool = None
 
+# ANSI color codes for beautiful logging
+GRN, RED, YEL, CYN, RST, BOLD = '\033[32m', '\033[31m', '\033[33m', '\033[36m', '\033[0m', '\033[1m'
+
+def log_ok(msg): print(f"  {GRN}✓{RST} {msg}", flush=True)
+def log_err(msg): print(f"  {RED}✗{RST} {msg}", flush=True)
+def log_info(msg): print(f"  {YEL}→{RST} {msg}", flush=True)
+def log_header(msg): print(f"{CYN}{msg}{RST}", flush=True)
+
 DEFAULT_CFG = {
     "mail_provider": "gsuite_imap",
     "imap_server": "imap.gmail.com",
@@ -333,8 +341,11 @@ def persist_account(result: dict):
         logger.exception("Failed to persist account to DB")
 
 
-async def run_account(cfg: dict, config_path: Path, use_9router: bool, proxy_url: str, headless: bool):
+async def run_account(cfg: dict, config_path: Path, use_9router: bool, proxy_url: str, headless: bool, account_num: int):
     global _proxy_pool
+
+    log_header(f"┌─ Account #{account_num} ─{'─'*56}")
+    start_time = time.time()
 
     MAX_RETRIES = 3
     cached_email = None
@@ -347,13 +358,12 @@ async def run_account(cfg: dict, config_path: Path, use_9router: bool, proxy_url
         if _proxy_pool:
             active_proxy = _proxy_pool.get_random_proxy()
             if active_proxy:
-                logger.info(f"Using proxy from pool: {active_proxy}")
+                log_info(f"Using proxy: {active_proxy}")
             else:
-                logger.warning("No available proxies in pool - running direct")
+                log_err("No available proxies - running direct")
         elif proxy_url:
-            # Fallback to single proxy from config/args
             active_proxy = proxy_url
-            logger.info(f"Using configured proxy: {active_proxy}")
+            log_info(f"Using configured proxy: {active_proxy}")
 
         try:
             provider = build_mail_provider(cfg, config_path)
@@ -391,13 +401,22 @@ async def run_account(cfg: dict, config_path: Path, use_9router: bool, proxy_url
             last_result = result
             incomplete = bool(result.get("incomplete"))
             email = result.get("email", "N/A")
+            elapsed = time.time() - start_time
 
             # Success if router9_exported=True or incomplete=False
             if not incomplete:
-                logger.info("✓ Success for %s (attempt %d/%d)", email, attempt, MAX_RETRIES)
-                # Report proxy success (keeps failure history)
+                # Report proxy success
                 if _proxy_pool and active_proxy:
                     _proxy_pool.report_success(active_proxy)
+
+                # Beautiful success summary
+                log_ok(f"{BOLD}{email}{RST} → imported in {elapsed:.1f}s")
+                if use_9router:
+                    log_info(f"Client ID: {result.get('client_id', 'N/A')[:20]}...")
+                    log_info(f"Region: {result.get('region', 'us-east-1')}")
+                    log_info(f"Auth Method: {result.get('auth_method', 'IdC')}")
+                log_header(f"└─{'─'*70}")
+
                 persist_account(result)
                 return result
 
@@ -411,16 +430,16 @@ async def run_account(cfg: dict, config_path: Path, use_9router: bool, proxy_url
                 cached_device_code = result["device_code_info"]
 
             fail_reason = result.get("failReason", "unknown")
-            logger.warning("⚠ Incomplete registration for %s: %s (attempt %d/%d)", email, fail_reason, attempt, MAX_RETRIES)
+            log_err(f"{email}: {fail_reason} (attempt {attempt}/{MAX_RETRIES})")
 
             # Retry delays: 5s, 10s, 15s
             if attempt < MAX_RETRIES:
                 delay = 5 * attempt
-                logger.info("Retrying in %ds...", delay)
+                log_info(f"Retrying in {delay}s...")
                 await asyncio.sleep(delay)
 
         except Exception as e:
-            logger.error("✗ Registration exception (attempt %d/%d): %s", attempt, MAX_RETRIES, e)
+            log_err(f"Exception (attempt {attempt}/{MAX_RETRIES}): {str(e)[:100]}")
 
             # Report proxy failure on exception
             if _proxy_pool and active_proxy:
@@ -428,15 +447,18 @@ async def run_account(cfg: dict, config_path: Path, use_9router: bool, proxy_url
 
             if attempt < MAX_RETRIES:
                 delay = 5 * attempt
-                logger.info("Retrying in %ds...", delay)
+                log_info(f"Retrying in {delay}s...")
                 await asyncio.sleep(delay)
 
-    # Final failure - persist last result if available
+    # Final failure
+    elapsed = time.time() - start_time
+    log_err(f"Failed after {MAX_RETRIES} retries ({elapsed:.1f}s)")
+    log_header(f"└─{'─'*70}")
+
     if last_result:
         persist_account(last_result)
         return last_result
 
-    # No result at all
     return {"incomplete": True, "failReason": "max retries exceeded", "email": "N/A"}
 
 
@@ -518,20 +540,50 @@ async def main():
 
     try:
         batch_id = 0
+        total_accounts = 0
+        total_success = 0
+        total_failed = 0
+
         while True:
             batch_id += 1
-            logger.info("Starting batch %d with %d account(s)", batch_id, count)
+            batch_success = 0
+            batch_failed = 0
+
+            log_header(f"\n{CYN}{'='*72}{RST}")
+            log_header(f"{BOLD}BATCH #{batch_id}{RST} - {count} account(s)")
+            log_header(f"{CYN}{'='*72}{RST}\n")
+
             for i in range(count):
+                total_accounts += 1
                 try:
-                    await run_account(cfg, config_path, args.nine_router, proxy_url, headless)
-                except Exception:
-                    logger.exception("Account registration failed")
+                    result = await run_account(cfg, config_path, args.nine_router, proxy_url, headless, total_accounts)
+                    if not result.get("incomplete"):
+                        batch_success += 1
+                        total_success += 1
+                    else:
+                        batch_failed += 1
+                        total_failed += 1
+                except Exception as e:
+                    log_err(f"Account registration crashed: {str(e)[:100]}")
+                    batch_failed += 1
+                    total_failed += 1
+
                 if i < count - 1:
-                    logger.info("Waiting %ds before next account", args.delay)
+                    log_info(f"Waiting {args.delay}s before next account...")
                     await asyncio.sleep(args.delay)
 
+            # Batch summary
+            log_header(f"\n{CYN}{'='*72}{RST}")
+            log_header(f"{BOLD}BATCH #{batch_id} SUMMARY{RST}")
+            log_header(f"{CYN}{'='*72}{RST}")
+            print(f"  ├─ Imported: {GRN}{batch_success}{RST}/{count}")
+            print(f"  ├─ Failed: {RED}{batch_failed}{RST}/{count}")
+            print(f"  ├─ Success Rate: {int(batch_success/count*100) if count else 0}%")
+            print(f"  └─ Total Imported (all batches): {GRN}{BOLD}{total_success}{RST}")
+            log_header(f"{CYN}{'='*72}{RST}\n")
+
             if loop_forever:
-                logger.info("Batch %d done; sleeping %ds before next cycle", batch_id, inter_batch)
+                log_info(f"Next batch in {inter_batch}s...")
                 await asyncio.sleep(inter_batch)
             else:
                 break
