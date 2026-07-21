@@ -28,6 +28,29 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
 
+# Load .env automatically so GUI users can set secrets without exporting manually.
+def _load_dotenv():
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv  # type: ignore[import]
+
+        load_dotenv(dotenv_path=env_path)
+    except Exception:
+        # Minimal fallback if python-dotenv is not installed.
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
+
 # When running as PyInstaller bundle, configure paths for bundled dependencies
 if getattr(sys, 'frozen', False):
     _bundle_dir = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(sys.executable).parent
@@ -68,10 +91,9 @@ KIRO_CACHE_DIR = Path.home() / ".aws" / "sso" / "cache"
 
 # ─── Registration Constants ─────────────────────────────────────────────────
 
-SHIROMAIL_BASE = "https://shiromail.galiais.com"
-SHIROMAIL_KEY = "sk_live_3fgiWLXZuS3dalfbGJV-uFgV"
-SHIROMAIL_DOMAIN_ID = 4
-
+SHIROMAIL_BASE = os.environ.get("SHIROMAIL_BASE_URL", "https://shiromail.galiais.com")
+SHIROMAIL_KEY = os.environ.get("SHIROMAIL_API_KEY", "")
+SHIROMAIL_DOMAIN_ID = int(os.environ.get("SHIROMAIL_DOMAIN_ID", "4") or "4")
 REG_OIDC = "https://oidc.us-east-1.amazonaws.com"
 REG_SCOPES = [
     "codewhisperer:completions", "codewhisperer:analysis",
@@ -93,8 +115,8 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = Path(__file__).parent
 
-DB_PATH = APP_DIR / "kiro_accounts.db"
-CONFIG_PATH = APP_DIR / "kiro_config.json"
+DB_PATH = Path(os.environ.get("DB_PATH", str(APP_DIR / "kiro_accounts.db")))
+CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", str(APP_DIR / "kiro_config.json")))
 
 
 def load_config():
@@ -1185,6 +1207,8 @@ class App(tk.Tk):
         self._reg_pro_trial = tk.BooleanVar(value=True)
         self._reg_import_no_trial = tk.BooleanVar(value=False)
         self._reg_use_roxy = tk.BooleanVar(value=False)
+        self._use_9router_flow = tk.BooleanVar(value=False)
+        self._reg_concurrency = tk.IntVar(value=1)
 
         ttk.Checkbutton(opts_frame, text="Headless", variable=self._reg_headless).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts_frame, text="Auto sign-in", variable=self._reg_auto_login).pack(side="left", padx=(0, 12))
@@ -1192,6 +1216,32 @@ class App(tk.Tk):
         ttk.Checkbutton(opts_frame, text="ProTrial subscription", variable=self._reg_pro_trial).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts_frame, text="Persist even without a trial", variable=self._reg_import_no_trial).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts_frame, text="Fingerprint browser", variable=self._reg_use_roxy).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(opts_frame, text="Use 9router OAuth Flow", variable=self._use_9router_flow).pack(side="left", padx=(0, 12))
+
+        # Batch automation config
+        batch_frame = ttk.LabelFrame(tab, text="Batch Automation", padding=(8, 4))
+        batch_frame.pack(fill="x", pady=(0, 8))
+
+        batch_row1 = ttk.Frame(batch_frame)
+        batch_row1.pack(fill="x", pady=2)
+        ttk.Label(batch_row1, text="Batch count:", width=12).pack(side="left")
+        self._reg_batch_count = tk.StringVar(value="10")
+        ttk.Entry(batch_row1, textvariable=self._reg_batch_count, width=10).pack(side="left", padx=4)
+        ttk.Label(batch_row1, text="Account delay (s):", width=15).pack(side="left", padx=(12, 0))
+        self._reg_account_delay = tk.StringVar(value="10")
+        ttk.Entry(batch_row1, textvariable=self._reg_account_delay, width=10).pack(side="left", padx=4)
+        ttk.Label(batch_row1, text="Batch delay (s):", width=15).pack(side="left", padx=(12, 0))
+        self._reg_batch_delay = tk.StringVar(value="60")
+        ttk.Entry(batch_row1, textvariable=self._reg_batch_delay, width=10).pack(side="left", padx=4)
+
+        batch_btn_frame = ttk.Frame(batch_frame)
+        batch_btn_frame.pack(fill="x", pady=(4, 0))
+        self._reg_auto_btn = ttk.Button(batch_btn_frame, text="Auto Register (Batch)", style="Green.TButton",
+                                        command=self._reg_auto_batch)
+        self._reg_auto_btn.pack(side="left", padx=(0, 5))
+        self._reg_continuous_btn = ttk.Button(batch_btn_frame, text="Continuous Mode", style="Green.TButton",
+                                              command=self._reg_continuous)
+        self._reg_continuous_btn.pack(side="left", padx=(0, 5))
 
         btn_frame = ttk.Frame(opts_frame)
         btn_frame.pack(side="right")
@@ -1616,8 +1666,30 @@ class App(tk.Tk):
             import random
             try:
                 self._reg_import_to_db(result)
-                self._reg_queue.put(("Account auto-imported into the database", "ok"))
+                self._reg_queue.put((f"✓ Account imported into database: {result['email']}", "ok"))
                 self._refresh_after_import(result.get("email", ""), self._reg_queue)
+
+                # Auto-export to 9router if enabled
+                cfg = load_config()
+                if cfg.get("enable_9router_export", False):
+                    try:
+                        from router9_export import Router9Exporter
+                        exporter = Router9Exporter(
+                            base_url=cfg.get("router9_url", "http://localhost:20128"),
+                            verify_ssl=cfg.get("router9_verify_ssl", True)
+                        )
+                        if exporter.check_connection():
+                            export_result = exporter.export_account_result(result, log=self._reg_log)
+                            if export_result["ok"]:
+                                self._reg_queue.put((f"✓ Account exported to 9router: {result['email']}", "ok"))
+                            else:
+                                self._reg_queue.put((f"9router export failed: {export_result.get('error', 'unknown')}", "warn"))
+                        else:
+                            self._reg_queue.put(("9router not accessible; skipping export", "warn"))
+                    except ImportError:
+                        self._reg_queue.put(("router9_export.py not found; skipping 9router export", "warn"))
+                    except Exception as e:
+                        self._reg_queue.put((f"9router export error: {e}", "err"))
             except Exception as e:
                 self._reg_queue.put((f"Database import failed: {e}", "err"))
             self.after(0, self._load_accounts_from_db)
@@ -1625,9 +1697,9 @@ class App(tk.Tk):
             if pro_trial and result.get("accessToken"):
                 self._reg_queue.put(("", "info"))
                 warmup = random.randint(30, 90)
-                self._reg_queue.put((f"Warm-up wait {warmup}s, simulating normal usage spacing...", "info"))
+                self._reg_queue.put((f"Warm-up delay: waiting {warmup}s to simulate natural user behavior before subscription", "info"))
                 time.sleep(warmup)
-                self._reg_queue.put(("Starting the Pro trial subscription...", "info"))
+                self._reg_queue.put((f"Starting Pro trial subscription for {result['email']}...", "info"))
                 try:
                     loop.run_until_complete(
                         self._reg_pro_trial_subscribe(result, loop)
@@ -1651,13 +1723,13 @@ class App(tk.Tk):
             try:
                 for attempt in range(1, MAX_RETRY + 1):
                     if self._reg_cancel:
-                        self._reg_queue.put(("User cancelled; stopping retries", "warn"))
+                        self._reg_queue.put(("Registration cancelled by user; stopping retry loop", "warn"))
                         break
                     if attempt > 1:
                         wait = random.randint(10, 30)
-                        self._reg_queue.put((f"Wait {wait}s s before starting # {attempt}/{MAX_RETRY}  registration attempts...", "info"))
+                        self._reg_queue.put((f"Retry delay: waiting {wait}s before attempt [{attempt}/{MAX_RETRY}]", "info"))
                         time.sleep(wait)
-                    self._reg_queue.put((f"[{attempt}/{MAX_RETRY}] Registration thread started; initialising...", "info"))
+                    self._reg_queue.put((f"[{attempt}/{MAX_RETRY}] Starting registration attempt (headless={headless}, concurrency={self._reg_concurrency.get()})", "info"))
                     try:
                         result = loop.run_until_complete(
                             self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy)
@@ -1668,14 +1740,15 @@ class App(tk.Tk):
                         continue
 
                     if not result or not result.get("email"):
-                        self._reg_queue.put(("Registration flow ended (no result returned))", "err"))
+                        self._reg_queue.put((f"[{attempt}/{MAX_RETRY}] Registration flow returned no result; retrying", "err"))
                         continue
 
-                    self._reg_queue.put((f"Email: {result['email']}", "highlight"))
-                    self._reg_queue.put((f"Password: {result['password']}", "highlight"))
+                    self._reg_queue.put((f"[{attempt}/{MAX_RETRY}] ✓ Registration successful: {result['email']}", "ok"))
+                    self._reg_queue.put((f"  Email: {result['email']}", "highlight"))
+                    self._reg_queue.put((f"  Password: {result['password']}", "highlight"))
 
                     # Account health check
-                    self._reg_queue.put(("Checking account status...", "info"))
+                    self._reg_queue.put(("Verifying account health (checking for bans/trial status)...", "info"))
                     status, reason = _check_account_health(result)
 
                     if status == "banned":
@@ -1698,15 +1771,33 @@ class App(tk.Tk):
                     # Account healthy
                     is_incomplete = result.get("incomplete", False)
                     if is_incomplete:
-                        self._reg_queue.put((f"[-] Registration incomplete ({result.get('failReason', '')}), skip-DB", "err"))
+                        fail_reason = result.get('failReason', '')
+                        self._reg_queue.put((f"[-] Registration incomplete ({fail_reason}), skip-DB", "err"))
+
                         if attempt < MAX_RETRY:
-                            self._reg_queue.put(("Will auto-register a replacement...", "warn"))
+                            # TES blocks need longer cooling time
+                            is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
+                            if is_tes_block:
+                                retry_delay = 15 + (attempt * 10)  # 15s, 25s, 35s
+                                self._reg_queue.put((f"⚠ AWS TES block detected. Cooling down {retry_delay}s before retry [{attempt + 1}/{MAX_RETRY}]", "warn"))
+                            else:
+                                retry_delay = 5 + (attempt * 3)  # 5s, 8s, 11s
+                                self._reg_queue.put((f"Non-TES failure. Waiting {retry_delay}s before retry [{attempt + 1}/{MAX_RETRY}]", "warn"))
+
+                            # Sleep with cancel check
+                            for _ in range(retry_delay * 10):
+                                if self._reg_cancel:
+                                    break
+                                time.sleep(0.1)
+
+                            if not self._reg_cancel:
+                                self._reg_queue.put(("Will auto-register a replacement...", "warn"))
                         continue
                     self._reg_queue.put(("Registration complete! Account is healthy", "ok"))
                     _do_import_and_subscribe(result, loop)
                     break
                 else:
-                    self._reg_queue.put((f"Maximum retry count reached ({MAX_RETRY}), stopping", "err"))
+                    self._reg_queue.put((f"⛔ Maximum retry limit reached ({MAX_RETRY} attempts exhausted). Registration failed.", "err"))
                 loop.close()
             except Exception as e:
                 self._reg_queue.put((f"Registration error: {e}", "err"))
@@ -1771,7 +1862,7 @@ class App(tk.Tk):
     def _reg_stop(self):
         """Signal the registration to abort."""
         self._reg_cancel = True
-        self._reg_log("User requested stop...", "err")
+        self._reg_log("⏹ Stop requested by user; cancelling active registration operations...", "warn")
 
     def _reg_pro_only(self):
         """Skip registration; run the Pro trial subscription against the most recent account already in the database"""
@@ -1794,8 +1885,8 @@ class App(tk.Tk):
         self._reg_running = True
         self._reg_cancel = False
         self._reg_term.delete("1.0", "end")
-        self._reg_term.insert("end", f"{datetime.now().strftime('%H:%M:%S')} [*] Run only the Pro trial subscription...\n", "info")
-        self._reg_term.insert("end", f"  Account: {row['email']}\n", "info")
+        self._reg_term.insert("end", f"{datetime.now().strftime('%H:%M:%S')} [*] PRO-ONLY MODE: Subscribing existing account to Pro trial (no registration)\n", "info")
+        self._reg_term.insert("end", f"  Target account: {row['email']}\n", "info")
         self._reg_start_btn.configure(state="disabled")
         self._reg_pro_only_btn.configure(state="disabled")
         self._reg_stop_btn.configure(state="normal")
@@ -1831,6 +1922,393 @@ class App(tk.Tk):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _reg_auto_batch(self):
+        """Auto register N accounts with delay between each."""
+        if self._reg_running:
+            return
+
+        try:
+            count = int(self._reg_batch_count.get())
+            delay = int(self._reg_account_delay.get())
+        except ValueError:
+            messagebox.showerror("Error", "Batch count and account delay must be integers")
+            return
+
+        if count <= 0:
+            messagebox.showerror("Error", "Batch count must be > 0")
+            return
+
+        self._reg_running = True
+        self._reg_cancel = False
+        self._reg_term.delete("1.0", "end")
+        self._reg_term.insert("end", f"[*] BATCH MODE STARTED: {count} accounts, {delay}s delay between accounts, max 3 retries per account\n", "info")
+        self._reg_start_btn.configure(state="disabled")
+        self._reg_auto_btn.configure(state="disabled")
+        self._reg_continuous_btn.configure(state="disabled")
+        self._reg_pro_only_btn.configure(state="disabled")
+        self._reg_stop_btn.configure(state="normal")
+        self.after(100, self._reg_poll_queue)
+
+        def _worker():
+            successful = 0
+            failed = 0
+
+            for i in range(1, count + 1):
+                if self._reg_cancel:
+                    self._reg_queue.put((f"Batch stopped by user at account {i-1}/{count}", "warn"))
+                    break
+
+                self._reg_queue.put((f"\n{'='*50}", "info"))
+                self._reg_queue.put((f"[Account {i}/{count}] Starting registration attempt...", "info"))
+
+                # Cache for retry persistence (per account scope)
+                cached_email = None
+                cached_device_code_data = None
+
+                # Retry loop per account
+                MAX_RETRY = 3
+                account_success = False
+
+                for attempt in range(1, MAX_RETRY + 1):
+                    if self._reg_cancel:
+                        break
+
+                    if attempt > 1:
+                        self._reg_queue.put((f"  [Account {i}/{count}] Retry attempt [{attempt}/{MAX_RETRY}]", "info"))
+
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+
+                        # Get registration options
+                        headless = self._reg_headless.get()
+                        auto_login = self._reg_auto_login.get()
+                        skip_onboard = self._reg_skip_onboard.get()
+                        use_roxy = self._reg_use_roxy.get()
+
+                        # Log cache status
+                        if cached_email:
+                            self._reg_queue.put((f"  Reusing cached email: {cached_email}", "info"))
+                        if cached_device_code_data:
+                            expires_at = cached_device_code_data.get("expires_at", 0)
+                            remaining = max(0, expires_at - time.time())
+                            self._reg_queue.put((f"  Reusing cached device code (expires in {int(remaining)}s)", "info"))
+
+                        result = loop.run_until_complete(
+                            self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy,
+                                                cached_email=cached_email, cached_device_code_data=cached_device_code_data)
+                        )
+
+                        if result and result.get("email"):
+                            # Cache email AND device code for next retry
+                            cached_email = result.get("email")
+                            cached_device_code_data = result.get("device_code_info")
+
+                            if cached_email:
+                                self._reg_queue.put((f"ℹ️  Email cached: {cached_email}", "info"))
+
+                            if cached_device_code_data:
+                                expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
+                                remaining = max(0, int(expires_at_timestamp - time.time()))
+                                self._reg_queue.put((f"ℹ️  Device code cached (expires in {remaining}s)", "info"))
+
+                                # Check if expired - clear cache if so
+                                if remaining <= 0:
+                                    self._reg_queue.put(("⚠️  Device code expired, clearing cache", "warn"))
+                                    cached_email = None
+                                    cached_device_code_data = None
+
+                            # Check if incomplete (TES block, export failure, etc.)
+                            is_incomplete = result.get("incomplete", False)
+                            if is_incomplete:
+                                fail_reason = result.get("failReason", "Unknown")
+                                self._reg_queue.put((f"❌ Registration incomplete: {fail_reason}", "err"))
+
+                                if attempt < MAX_RETRY:
+                                    # TES blocks need longer cooling
+                                    is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
+                                    retry_delay = (15 + (attempt * 10)) if is_tes_block else (5 + (attempt * 3))
+                                    self._reg_queue.put((f"  Waiting {retry_delay}s before retry...", "warn"))
+
+                                    for _ in range(retry_delay * 10):
+                                        if self._reg_cancel:
+                                            break
+                                        time.sleep(0.1)
+                                continue
+
+                            # Complete and healthy - import to DB
+                            successful += 1
+                            account_success = True
+                            self._reg_queue.put((f"✅ Success! Email: {result['email']}", "ok"))
+
+                            # Import to database and subscribe if enabled
+                            try:
+                                self._reg_import_to_db(result)
+                                self._reg_queue.put(("  Imported to database", "ok"))
+
+                                # Auto-subscribe to Pro if enabled
+                                if self._reg_pro_trial.get():
+                                    self._reg_queue.put(("  Starting Pro trial subscription...", "info"))
+                                    loop.run_until_complete(self._reg_pro_trial_subscribe(result, loop))
+                            except Exception as e:
+                                self._reg_queue.put((f"  DB import/subscribe error: {e}", "warn"))
+
+                            break
+                        else:
+                            # Other failure
+                            error = result.get("error", "Unknown") if result else "No result"
+                            self._reg_queue.put((f"❌ Failed: {error}", "err"))
+                            if attempt < MAX_RETRY:
+                                self._reg_queue.put((f"  Waiting 5s before retry...", "warn"))
+                                for _ in range(50):
+                                    if self._reg_cancel:
+                                        break
+                                    time.sleep(0.1)
+                            continue
+
+                    except Exception as e:
+                        self._reg_queue.put((f"❌ Error: {e}", "err"))
+                        if attempt < MAX_RETRY:
+                            self._reg_queue.put((f"  Waiting 5s before retry...", "warn"))
+                            for _ in range(50):
+                                if self._reg_cancel:
+                                    break
+                                time.sleep(0.1)
+
+                if not account_success:
+                    failed += 1
+
+                if i < count and not self._reg_cancel:
+                    self._reg_queue.put((f"⏳ Account delay: waiting {delay}s before next registration [{i+1}/{count}]", "info"))
+                    for _ in range(delay * 10):
+                        if self._reg_cancel:
+                            break
+                        time.sleep(0.1)
+
+            self._reg_queue.put((f"\n{'='*50}", "info"))
+            self._reg_queue.put((f"BATCH MODE COMPLETED", "info"))
+            self._reg_queue.put((f"  Total accounts attempted: {count}", "info"))
+            self._reg_queue.put((f"  ✓ Successful: {successful}", "ok"))
+            self._reg_queue.put((f"  ✗ Failed: {failed}", "err"))
+            self._reg_queue.put((f"{'='*50}", "info"))
+
+            self._reg_running = False
+            self.after(0, lambda: self._reg_start_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_auto_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_continuous_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_pro_only_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_stop_btn.configure(state="disabled"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _reg_continuous(self):
+        """Continuous registration mode - infinite loop with batch delays."""
+        if self._reg_running:
+            return
+
+        try:
+            batch_count = int(self._reg_batch_count.get())
+            account_delay = int(self._reg_account_delay.get())
+            batch_delay = int(self._reg_batch_delay.get())
+        except ValueError:
+            messagebox.showerror("Error", "All delay values must be integers")
+            return
+
+        if batch_count <= 0:
+            messagebox.showerror("Error", "Batch count must be > 0")
+            return
+
+        self._reg_running = True
+        self._reg_cancel = False
+        self._reg_term.delete("1.0", "end")
+        self._reg_term.insert("end", f"[*] CONTINUOUS MODE STARTED (runs until stopped)\n", "info")
+        self._reg_term.insert("end", f"    Accounts per batch: {batch_count}\n", "info")
+        self._reg_term.insert("end", f"    Account delay: {account_delay}s\n", "info")
+        self._reg_term.insert("end", f"    Batch delay: {batch_delay}s\n", "info")
+        self._reg_term.insert("end", f"    Max retries per account: 3\n", "info")
+        self._reg_term.insert("end", f"    Stop: Press 'Stop' button\n", "info")
+        self._reg_start_btn.configure(state="disabled")
+        self._reg_auto_btn.configure(state="disabled")
+        self._reg_continuous_btn.configure(state="disabled")
+        self._reg_pro_only_btn.configure(state="disabled")
+        self._reg_stop_btn.configure(state="normal")
+        self.after(100, self._reg_poll_queue)
+
+        def _worker():
+            batch_num = 0
+            total_successful = 0
+            total_failed = 0
+
+            while not self._reg_cancel:
+                batch_num += 1
+                batch_successful = 0
+                batch_failed = 0
+
+                self._reg_queue.put((f"\n{'='*50}", "info"))
+                self._reg_queue.put((f"BATCH #{batch_num} STARTED", "info"))
+                self._reg_queue.put((f"{'='*50}", "info"))
+
+                for i in range(1, batch_count + 1):
+                    if self._reg_cancel:
+                        break
+
+                    self._reg_queue.put((f"\n[Batch #{batch_num}, Account {i}/{batch_count}] Starting registration...", "info"))
+
+                    # Cache for retry persistence (per account scope)
+                    cached_email = None
+                    cached_device_code_data = None
+
+                    # Retry loop per account
+                    MAX_RETRY = 3
+                    account_success = False
+
+                    for attempt in range(1, MAX_RETRY + 1):
+                        if self._reg_cancel:
+                            break
+
+                        if attempt > 1:
+                            self._reg_queue.put((f"  [Batch #{batch_num}, Account {i}/{batch_count}] Retry [{attempt}/{MAX_RETRY}]", "info"))
+
+                        try:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+
+                            # Get registration options
+                            headless = self._reg_headless.get()
+                            auto_login = self._reg_auto_login.get()
+                            skip_onboard = self._reg_skip_onboard.get()
+                            use_roxy = self._reg_use_roxy.get()
+
+                            # Log cache status
+                            if cached_email:
+                                self._reg_queue.put((f"  Reusing cached email: {cached_email}", "info"))
+                            if cached_device_code_data:
+                                expires_at = cached_device_code_data.get("expires_at", 0)
+                                remaining = max(0, expires_at - time.time())
+                                self._reg_queue.put((f"  Reusing cached device code (expires in {int(remaining)}s)", "info"))
+
+                            result = loop.run_until_complete(
+                                self._reg_async_main(headless, auto_login, skip_onboard, use_roxy=use_roxy,
+                                                    cached_email=cached_email, cached_device_code_data=cached_device_code_data)
+                            )
+
+                            if result and result.get("email"):
+                                # Cache email AND device code for next retry
+                                cached_email = result.get("email")
+                                cached_device_code_data = result.get("device_code_info")
+
+                                if cached_email:
+                                    self._reg_queue.put((f"ℹ️  Email cached: {cached_email}", "info"))
+
+                                if cached_device_code_data:
+                                    expires_at_timestamp = cached_device_code_data.get("expires_at_timestamp", 0)
+                                    remaining = max(0, int(expires_at_timestamp - time.time()))
+                                    self._reg_queue.put((f"ℹ️  Device code cached (expires in {remaining}s)", "info"))
+
+                                    # Check if expired - clear cache if so
+                                    if remaining <= 0:
+                                        self._reg_queue.put(("⚠️  Device code expired, clearing cache", "warn"))
+                                        cached_email = None
+                                        cached_device_code_data = None
+
+                                # Check if incomplete (TES block, export failure, etc.)
+                                is_incomplete = result.get("incomplete", False)
+                                if is_incomplete:
+                                    fail_reason = result.get("failReason", "Unknown")
+                                    self._reg_queue.put((f"❌ Registration incomplete: {fail_reason}", "err"))
+
+                                    if attempt < MAX_RETRY:
+                                        # TES blocks need longer cooling
+                                        is_tes_block = "TES" in fail_reason or "Blocked" in fail_reason
+                                        retry_delay = (15 + (attempt * 10)) if is_tes_block else (5 + (attempt * 3))
+                                        delay_reason = "TES block cooldown" if is_tes_block else "standard retry delay"
+                                        self._reg_queue.put((f"  ⚠ {delay_reason}: waiting {retry_delay}s before retry [{attempt + 1}/{MAX_RETRY}]", "warn"))
+
+                                        for _ in range(retry_delay * 10):
+                                            if self._reg_cancel:
+                                                break
+                                            time.sleep(0.1)
+                                    continue
+
+                                # Complete and healthy - import to DB
+                                batch_successful += 1
+                                total_successful += 1
+                                account_success = True
+                                self._reg_queue.put((f"✅ Success! Email: {result['email']}", "ok"))
+
+                                # Import to database and subscribe if enabled
+                                try:
+                                    self._reg_import_to_db(result)
+                                    self._reg_queue.put(("  Imported to database", "ok"))
+
+                                    # Auto-subscribe to Pro if enabled
+                                    if self._reg_pro_trial.get():
+                                        self._reg_queue.put(("  Starting Pro trial subscription...", "info"))
+                                        loop.run_until_complete(self._reg_pro_trial_subscribe(result, loop))
+                                except Exception as e:
+                                    self._reg_queue.put((f"  DB import/subscribe error: {e}", "warn"))
+
+                                break
+                            else:
+                                # Other failure
+                                error = result.get("error", "Unknown") if result else "No result"
+                                self._reg_queue.put((f"❌ Failed: {error}", "err"))
+                                if attempt < MAX_RETRY:
+                                    self._reg_queue.put((f"  Waiting 5s before retry...", "warn"))
+                                    for _ in range(50):
+                                        if self._reg_cancel:
+                                            break
+                                        time.sleep(0.1)
+                                continue
+
+                        except Exception as e:
+                            self._reg_queue.put((f"❌ Error: {e}", "err"))
+                            if attempt < MAX_RETRY:
+                                self._reg_queue.put((f"  Waiting 5s before retry...", "warn"))
+                                for _ in range(50):
+                                    if self._reg_cancel:
+                                        break
+                                    time.sleep(0.1)
+
+                    if not account_success:
+                        batch_failed += 1
+                        total_failed += 1
+
+                    if i < batch_count and not self._reg_cancel:
+                        self._reg_queue.put((f"⏳ Account delay {account_delay}s...", "info"))
+                        for _ in range(account_delay * 10):
+                            if self._reg_cancel:
+                                break
+                            time.sleep(0.1)
+
+                self._reg_queue.put((f"\nBatch #{batch_num} completed: ✅ {batch_successful} successful | ❌ {batch_failed} failed", "info"))
+                self._reg_queue.put((f"Cumulative totals: ✅ {total_successful} successful | ❌ {total_failed} failed", "info"))
+
+                if self._reg_cancel:
+                    break
+
+                self._reg_queue.put((f"\n⏳ Batch delay: waiting {batch_delay}s before starting batch #{batch_num + 1}", "info"))
+                for _ in range(batch_delay * 10):
+                    if self._reg_cancel:
+                        break
+                    time.sleep(0.1)
+
+            self._reg_queue.put((f"\n{'='*50}", "info"))
+            self._reg_queue.put((f"CONTINUOUS MODE STOPPED", "warn"))
+            self._reg_queue.put((f"  Total batches completed: {batch_num}", "info"))
+            self._reg_queue.put((f"  ✓ Total successful: {total_successful}", "ok"))
+            self._reg_queue.put((f"  ✗ Total failed: {total_failed}", "err"))
+            self._reg_queue.put((f"{'='*50}", "info"))
+
+            self._reg_running = False
+            self.after(0, lambda: self._reg_start_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_auto_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_continuous_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_pro_only_btn.configure(state="normal"))
+            self.after(0, lambda: self._reg_stop_btn.configure(state="disabled"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _reg_import_to_db(self, result):
         """Import a successful registration result into the SQLite DB."""
         account_data = {
@@ -1858,7 +2336,7 @@ class App(tk.Tk):
         }
         db_upsert_account(self.conn, account_data)
 
-    async def _reg_async_main(self, headless=True, auto_login=True, skip_onboard=True, use_roxy=False):
+    async def _reg_async_main(self, headless=True, auto_login=True, skip_onboard=True, use_roxy=False, cached_email=None, cached_device_code_data=None):
         """Drives the full registration flow via the kiro_register or roxy_register module"""
         from mail_providers import get_provider
         mail_url = self._reg_mail_url.get().strip() or None
@@ -1912,15 +2390,52 @@ class App(tk.Tk):
             )
         else:
             import kiro_register
-            return await kiro_register.register(
-                headless=headless,
-                auto_login=auto_login,
-                skip_onboard=skip_onboard,
-                mail_provider_instance=mail_instance,
-                proxy_url=proxy_url,
-                log=self._reg_log,
-                cancel_check=lambda: self._reg_cancel,
-            )
+
+            # Check if 9router OAuth flow is enabled
+            if self._use_9router_flow.get():
+                cfg = load_config()
+                router9_config = {
+                    "base_url": cfg.get("router9_url", "http://localhost:20128"),
+                    "password": cfg.get("router9_password", ""),
+                    "auth_token": cfg.get("router9_auth_token", ""),
+                    "auth_token_expires_at": cfg.get("router9_auth_token_expires_at", ""),
+                }
+
+                if not router9_config["password"]:
+                    self._reg_log("9router password not configured in kiro_config.json", "err")
+                    return None
+
+                result = await kiro_register.register_via_9router_oauth(
+                    headless=headless,
+                    auto_login=auto_login,
+                    skip_onboard=skip_onboard,
+                    mail_provider_instance=mail_instance,
+                    router9_config=router9_config,
+                    proxy_url=proxy_url,
+                    log=self._reg_log,
+                    cancel_check=lambda: self._reg_cancel,
+                    cached_email=cached_email,
+                    cached_device_code_data=cached_device_code_data
+                )
+
+                # Update cached auth token in config if refreshed
+                if result and router9_config.get("auth_token"):
+                    cfg["router9_auth_token"] = router9_config["auth_token"]
+                    cfg["router9_auth_token_expires_at"] = router9_config["auth_token_expires_at"]
+                    save_config(cfg)
+
+                return result
+            else:
+                # Original registration flow
+                return await kiro_register.register(
+                    headless=headless,
+                    auto_login=auto_login,
+                    skip_onboard=skip_onboard,
+                    mail_provider_instance=mail_instance,
+                    proxy_url=proxy_url,
+                    log=self._reg_log,
+                    cancel_check=lambda: self._reg_cancel,
+                )
 
     async def _reg_pro_trial_subscribe(self, result, loop):
         """After registration, automatically subscribe to the Pro trial (using an EFunCard virtual credit card)"""
@@ -1956,13 +2471,14 @@ class App(tk.Tk):
         cdk_code = self._reg_cdk_code.get().strip()
 
         if not cdk_code:
-            log("CDK code not provided; skipping Pro trial subscription", "err")
+            log("⚠ CDK code not configured; skipping Pro trial subscription flow", "warn")
             return
 
         # Step 1: Query available plans
+        log("Querying available subscription plans from AWS...", "info")
         subs = kiro_subscribe.list_available_subscriptions(access_token, profile_arn, log=log)
         if not subs.get("ok"):
-            log("Failed to fetch the subscription plan list", "err")
+            log("❌ Failed to fetch subscription plan list from AWS", "err")
             return
 
         # Found the KIRO_PRO plan
@@ -1978,35 +2494,37 @@ class App(tk.Tk):
         if not pro_type:
             pro_type = "KIRO_PRO"
 
-        log(f"Subscription type: {pro_type}", "info")
+        log(f"✓ Detected subscription plan: {pro_type}", "info")
 
         # Step 2: Fetching the Stripe payment URL
+        log("Generating Stripe checkout session URL...", "info")
         token_result = kiro_subscribe.create_subscription_token(
             access_token, profile_arn, pro_type, log=log
         )
         if not token_result.get("ok") or not token_result.get("url"):
-            log("Failed to fetch payment URL", "err")
+            log("❌ Failed to generate Stripe payment URL", "err")
             return
 
         payment_url = token_result["url"]
-        log(f"Payment URL: {payment_url[:80]}...", "info")
+        log(f"✓ Payment URL generated: {payment_url[:80]}...", "info")
 
         # Step 3: Pre-check — Open the Stripe page to determine whether $0 Trial
-        log("Probe trial status: open the payment page and read the amount due today...", "info")
+        log("Verifying trial status: checking Stripe checkout page for $0 trial eligibility...", "info")
         page_info = await kiro_subscribe.fetch_checkout_page_async(payment_url, log=log)
         if page_info:
             is_free = page_info.get("is_free_trial", False)
             total_due = page_info.get("total_due_today", "unknown")
-            log(f"Due today: {total_due}", "info")
+            log(f"Amount due today: {total_due}", "info")
             if not is_free:
-                log(f"non- $0 trial (due today: {total_due}), aborting subscription so the CDK card is not consumed", "err")
+                log(f"⚠ Non-$0 trial detected (due today: {total_due}). Aborting to preserve CDK card.", "err")
                 return
-            log("Confirm as $0 free trial; continuing with automatic payment...", "ok")
+            log("✓ Confirmed $0 free trial. Proceeding with automated payment flow...", "ok")
         else:
-            log("Could not read the amount from the page (the link may have expired); aborting", "err")
+            log("❌ Could not verify trial amount (payment link may be expired). Aborting.", "err")
             return
 
         # Step 4: Use EFunCard + Stripe Auto-pay
+        log(f"Initiating Stripe checkout automation with CDK card (code: {cdk_code[:4]}****{cdk_code[-4:]})...", "info")
         captcha_cfg = {
             "yescaptcha_key": yescaptcha_key,
             "multibot_key": multibot_key,
@@ -2017,7 +2535,7 @@ class App(tk.Tk):
         )
 
         if pay_result and pay_result.get("ok"):
-            log("Pro Trial subscription succeeded!", "ok")
+            log(f"✓ Pro trial subscription completed successfully for {result['email']}", "ok")
             try:
                 rows = db_get_all(self.conn)
                 for row in rows:
@@ -2032,10 +2550,10 @@ class App(tk.Tk):
             except Exception:
                 pass
         elif pay_result and pay_result.get("status") == "not_free_trial":
-            log(f"This account is not eligible for the free trial: {pay_result.get('message', '')}", "err")
+            log(f"❌ Account not eligible for free trial: {pay_result.get('message', 'Unknown reason')}", "err")
         else:
             reason = pay_result.get("message", str(pay_result)) if pay_result else "Unknown error"
-            log(f"Pro Trial subscription incomplete: {reason}", "err")
+            log(f"❌ Pro trial subscription failed: {reason}", "err")
 
     # ─── Tab 4: Manual sign-in ─────────────────────────────────────────────────
     def _build_tab_manual_login(self):

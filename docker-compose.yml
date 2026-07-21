@@ -1,0 +1,42 @@
+services:
+  kiro-service:
+    build: .
+    container_name: kiro-register-service
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CONFIG_PATH=/config/kiro_config.json
+      - DOMAINS_PATH=/config/domains.txt
+      - DB_PATH=/data/accounts.db
+      # Override mail provider with env so nothing secret is baked into the image:
+      # - MAIL_PROVIDER=gsuite_imap
+      # - IMAP_USER=user@gmail.com
+      # - IMAP_PASS=app_password
+      # - DOMAINS=example.com,example.net
+      # - CAPTCHA_PROVIDER=multibot
+      # - MULTIBOT_API_KEY=xxx
+      # - ROUTER9_URL=https://oapi.fastev.my.id
+      # - ROUTER9_PASSWORD=xxx
+    # Default loop: one account every 5 minutes (headless).
+    command: >
+      python service.py --service --delay 300 --headless
+
+volumes:
+  kiro-data:
+    driver: local
+
+# Usage examples:
+#
+# Build image:
+#   docker-compose build
+#
+# Run a one-off batch of 10 accounts:
+#   docker-compose run --rm kiro-service python service.py --batch 10 --delay 300 --headless
+#
+# Run service mode:
+#   docker-compose run --rm kiro-service python service.py --service --delay 300 --headless
+#
+# Run batch-loop mode (10 per batch, 1 hour between batches):
+#   docker-compose run --rm kiro-service python service.py --batch-loop 10 --delay 300 --batch-delay 3600 --headless

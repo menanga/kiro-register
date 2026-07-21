@@ -26,9 +26,9 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 # --- Constants ---------------------------------------------------------------
 
-SHIROMAIL_BASE = ""
-SHIROMAIL_KEY = ""
-SHIROMAIL_DOMAIN_ID = 0
+SHIROMAIL_BASE = os.environ.get("SHIROMAIL_BASE_URL", "")
+SHIROMAIL_KEY = os.environ.get("SHIROMAIL_API_KEY", "")
+SHIROMAIL_DOMAIN_ID = int(os.environ.get("SHIROMAIL_DOMAIN_ID", "0") or "0")
 
 REG_OIDC = "https://oidc.us-east-1.amazonaws.com"
 REG_SCOPES = [
@@ -298,7 +298,7 @@ def inject_machine_ids(log=print):
     """Inject randomised machine identifiers into Kiro's storage.json."""
     storage_path = Path(os.environ.get("APPDATA", "")) / "Kiro" / "User" / "globalStorage" / "storage.json"
     if not storage_path.exists():
-        log("storage.json not found; skipping machine-id injection", "warn")
+        log(f"storage.json not found at {storage_path}; skipping machine-id injection", "warn")
         return None
 
     ids = _random_machine_ids()
@@ -307,10 +307,10 @@ def inject_machine_ids(log=print):
         for key, value in ids.items():
             storage[key] = value
         storage_path.write_text(json.dumps(storage, indent=4), encoding="utf-8")
-        log(f"Machine IDs injected: machineId={ids['telemetry.machineId'][:16]}...", "ok")
+        log(f"Machine IDs injected into storage.json: machineId={ids['telemetry.machineId'][:16]}..., devDeviceId={ids['telemetry.devDeviceId'][:16]}...", "ok")
         return ids
     except Exception as e:
-        log(f"Machine-id injection failed: {e}", "error")
+        log(f"Machine-id injection failed during storage.json write: {e}", "err")
         return None
 
 
@@ -423,7 +423,7 @@ def persist_tokens(client_id, client_secret, access_token, refresh_token, expire
         os.chmod(token_path, stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
-    log("Token written locally", "ok")
+    log(f"OAuth token written to {token_path}", "ok")
     client_data = {
         "clientId": client_id,
         "clientSecret": client_secret,
@@ -435,7 +435,7 @@ def persist_tokens(client_id, client_secret, access_token, refresh_token, expire
         os.chmod(client_path, stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
-    log("Client credentials saved", "ok")
+    log(f"OIDC client credentials saved to {client_path}", "ok")
 
 
 def skip_onboarding(log=print):
@@ -446,10 +446,10 @@ def skip_onboarding(log=print):
         storage = json.loads(storage_path.read_text(encoding="utf-8"))
         storage["kiroAgent.onboarding.onboardingCompleted"] = "true"
         storage_path.write_text(json.dumps(storage, indent=2), encoding="utf-8")
-        log("Onboarding skipped", "ok")
+        log(f"Onboarding flag set in storage.json: onboardingCompleted=true", "ok")
         return True
     except Exception as e:
-        log(f"Failed to skip onboarding: {e}", "err")
+        log(f"Failed to update onboarding flag in storage.json: {e}", "err")
         return False
 
 
@@ -554,13 +554,13 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
 
     # Build a random fingerprint config.
     fp_config = _random_fingerprint_config()
-    log(f"Browser fingerprint: Chrome/{fp_config['user_agent'].split('Chrome/')[1].split(' ')[0]}, "
-        f"{fp_config['viewport']['width']}x{fp_config['viewport']['height']}, "
-        f"{fp_config['timezone']}", "dbg")
+    log(f"Generated browser fingerprint: Chrome/{fp_config['user_agent'].split('Chrome/')[1].split(' ')[0]}, "
+        f"viewport={fp_config['viewport']['width']}x{fp_config['viewport']['height']}, "
+        f"timezone={fp_config['timezone']}", "dbg")
 
     pw_proxy = _parse_proxy_url(proxy_url)
     if pw_proxy:
-        log(f"Proxy enabled: {pw_proxy['server']}", "ok")
+        log(f"Residential proxy configured: {pw_proxy['server']}", "info")
 
     if proxy_url:
         s = curl_requests.Session(
@@ -576,9 +576,9 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     email = mail.create_mailbox()
     password = _generate_password()
     full_name = _generate_name()
-    log(f"Email: {email}", "ok")
-    log(f"Password: {password[:4]}****")
-    log(f"Name: {full_name}")
+    log(f"Generated credentials - Email: {email}", "info")
+    log(f"Generated credentials - Password: {password[:4]}****", "dbg")
+    log(f"Generated credentials - Name: {full_name}", "dbg")
 
     def _partial_result(reason="unknown"):
         """Return a partial record when registration fails mid-way so callers can still persist it."""
@@ -596,7 +596,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
         }
 
     # Phase 1: OIDC client registration
-    log("Phase 1: OIDC client registration")
+    log("Phase 1: Starting OIDC client registration with AWS", "info")
     code_verifier = secrets.token_urlsafe(64)
     code_challenge = _b64url(hashlib.sha256(code_verifier.encode()).digest())
     state_val = secrets.token_urlsafe(32)
@@ -609,11 +609,11 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     }, timeout=25, verify=False)
     reg = reg_resp.json()
     if "clientId" not in reg:
-        log(f"OIDC registration failed: {reg}", "err")
+        log(f"OIDC client registration failed - response: {reg}", "err")
         return _partial_result("OIDC registration failed")
     client_id = reg["clientId"]
     client_secret = reg["clientSecret"]
-    log("OIDC client registered", "ok")
+    log(f"OIDC client registered successfully - clientId: {client_id[:16]}...", "ok")
 
     signin_url = f"{KIRO_SIGNIN_URL}?" + urlencode({
         "state": state_val,
@@ -624,7 +624,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     })
 
     # Phase 2: local callback server + Playwright
-    log(f"Phase 2: launching browser (headless={headless})")
+    log(f"Phase 2: Launching Playwright browser for registration flow (headless={headless})", "info")
     authorization_code = ""
 
     class CallbackHandler(BaseHTTPRequestHandler):
@@ -637,14 +637,14 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
             code = qs.get("code", [""])[0]
             if code:
                 authorization_code = code
-                log("Authorization callback received", "ok")
+                log(f"OAuth authorization code received from callback server", "ok")
                 self_h.send_response(200)
                 self_h.send_header("Content-Type", "text/html")
                 self_h.end_headers()
                 self_h.wfile.write(b"<html><body><h2>Registration complete!</h2></body></html>")
             elif "signin/callback" in parsed.path or qs.get("login_option"):
                 CallbackHandler.signin_callback_params = {k: v[0] for k, v in qs.items()}
-                log("Sign-in callback received", "ok")
+                log(f"AWS signin callback received from redirect chain", "ok")
                 self_h.send_response(200)
                 self_h.send_header("Content-Type", "text/html")
                 self_h.end_headers()
@@ -768,6 +768,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                 device_scale_factor=fp_config["pixel_ratio"],
             )
             page = await context.new_page()
+            page.set_default_timeout(90000)  # 90s timeout for all operations
             await Stealth().apply_stealth_async(page)
 
             # Track the latest create-identity outcome so the OTP retry loop can
@@ -907,7 +908,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
             await asyncio.sleep(2)
 
             if "profile.aws" not in page.url:
-                log(f"Failed to reach registration page (current: {page.url})", "err")
+                log(f"Failed to reach profile.aws registration page after navigation (current URL: {page.url})", "err")
                 await browser.close()
                 callback_server.shutdown()
                 return _partial_result("did not reach registration page")
@@ -1175,7 +1176,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                     callback_server.shutdown()
                     return _partial_result("OTP timeout")
 
-                log(f"OTP received: {otp_code}", "ok")
+                log(f"OTP code received from mail provider: {otp_code}", "info")
                 # Simulate a human switching back from the mail client by nudging the mouse first.
                 await _human_delay(2, 4)
                 try:
@@ -1444,7 +1445,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     }, timeout=25, verify=False)
 
     if token_resp.status_code != 200:
-        log(f"Token exchange failed: HTTP {token_resp.status_code}", "err")
+        log(f"OAuth token exchange failed with HTTP {token_resp.status_code} from {REG_OIDC}/token", "err")
         return _partial_result("token exchange failed")
 
     tokens = token_resp.json()
@@ -1453,24 +1454,24 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
     expires_in = tokens.get("expiresIn", 28800)
 
     if not access_token:
-        log("Token exchange did not return an accessToken", "err")
+        log("Token exchange returned empty accessToken in response", "err")
         return _partial_result("missing accessToken")
 
-    log("Tokens obtained", "ok")
+    log(f"OAuth tokens obtained successfully (accessToken expires in {expires_in}s)", "ok")
 
     # Inject local tokens + random machine IDs.
     if auto_login:
-        log("Injecting local tokens...", "info")
+        log("Injecting OAuth tokens and machine IDs into local Kiro storage", "info")
         persist_tokens(client_id, client_secret, access_token, refresh_token, expires_in, log, email=email)
         machine_ids = inject_machine_ids(log)
         if skip_onboard:
             skip_onboarding(log)
 
-    log("=" * 40, "ok")
-    log("Registration complete!", "ok")
-    log(f"  Email: {email}", "ok")
-    log(f"  Password: {password}", "ok")
-    log("=" * 40, "ok")
+    log("=" * 40, "info")
+    log("AWS Builder ID registration completed successfully!", "ok")
+    log(f"  Account Email: {email}", "info")
+    log(f"  Account Password: {password}", "info")
+    log("=" * 40, "info")
 
     return {
         "email": email,
@@ -1485,4 +1486,807 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
         "accessToken": access_token,
         "refreshToken": refresh_token,
         "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).strftime("%Y/%m/%d %H:%M:%S"),
+    }
+
+
+# ============================================================================
+# 9router OAuth Device Code Flow Registration
+# ============================================================================
+
+async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboard=True,
+                                     mail_provider_instance=None,
+                                     router9_config=None,
+                                     proxy_url=None,
+                                     log=print, cancel_check=None,
+                                     cached_email=None,
+                                     cached_device_code_data=None):
+    """
+    Register AWS Builder ID via 9router OAuth device code flow.
+
+    Automatically exports account to 9router during registration instead of
+    requiring a separate export step afterward.
+
+    Args:
+        headless: run browser headlessly
+        auto_login: inject local tokens after registration
+        skip_onboard: skip onboarding flow
+        mail_provider_instance: MailProvider instance
+        router9_config: dict with {base_url, password, auth_token, auth_token_expires_at}
+        proxy_url: optional HTTP/SOCKS proxy
+        log: logging callback
+        cached_email: optional pre-generated email to reuse (avoids creating new mailbox)
+        cached_device_code_data: optional dict with device code to reuse if not expired
+            {device_code, verification_uri_complete, client_id, client_secret,
+             code_verifier, region, user_code, expires_at_timestamp}
+        cancel_check: callable returning True to abort
+
+    Returns:
+        dict with account info + router9_exported flag, or None
+    """
+    from curl_cffi import requests as curl_requests
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
+    from router9_oauth import Router9OAuthClient
+
+    if cancel_check and cancel_check():
+        return None
+
+    if not router9_config:
+        log("router9_config required for 9router OAuth device code registration flow", "err")
+        return None
+
+    # Setup
+    fp_config = _random_fingerprint_config()
+    log(f"Generated browser fingerprint for 9router flow: Chrome/{fp_config['user_agent'].split('Chrome/')[1].split(' ')[0]}, "
+        f"viewport={fp_config['viewport']['width']}x{fp_config['viewport']['height']}", "dbg")
+
+    pw_proxy = _parse_proxy_url(proxy_url)
+    if pw_proxy:
+        log(f"Proxy: {pw_proxy['server']}", "ok")
+
+    if not mail_provider_instance:
+        log("mail_provider_instance required for 9router OAuth registration flow", "err")
+        return None
+
+    mail = mail_provider_instance
+
+    # Email cache reuse
+    if cached_email:
+        email = cached_email
+        log(f"Reusing cached email: {email}", "dbg")
+        # Reset mail provider state to allow polling new OTP
+        if hasattr(mail, '_seen_uids'):
+            mail._seen_uids = set()
+            log("Reset mail provider seen UIDs for fresh OTP polling", "dbg")
+        if hasattr(mail, '_created_at'):
+            mail._created_at = time.time()
+            log("Reset mail provider created timestamp", "dbg")
+    else:
+        email = mail.create_mailbox()
+        log(f"Generated new email: {email}", "dbg")
+
+    password = _generate_password()
+    full_name = _generate_name()
+    log(f"Email: {email}", "ok")
+
+    def _partial(reason="unknown"):
+        return {
+            "email": email, "password": password, "full_name": full_name,
+            "provider": "BuilderId", "authMethod": "IdC", "region": "us-east-1",
+            "accessToken": "", "refreshToken": "", "incomplete": True,
+            "failReason": reason, "router9_exported": False,
+            "device_code_info": {
+                "device_code": device_code if 'device_code' in locals() else "",
+                "verification_uri_complete": verify_url if 'verify_url' in locals() else "",
+                "client_id": client_id if 'client_id' in locals() else "",
+                "client_secret": client_secret if 'client_secret' in locals() else "",
+                "code_verifier": code_verifier if 'code_verifier' in locals() else "",
+                "region": region,
+                "user_code": user_code if 'user_code' in locals() else "",
+                "expires_at_timestamp": device_code_expires_at if 'device_code_expires_at' in locals() else 0,
+            } if 'device_code' in locals() else None,
+        }
+
+    # Phase 1: 9router device code
+    log("Phase 1: 9router OAuth device code")
+    r9 = Router9OAuthClient(router9_config["base_url"], router9_config["password"])
+
+    ok, token, expires = r9.ensure_auth_token(
+        router9_config.get("auth_token"),
+        router9_config.get("auth_token_expires_at"),
+        log
+    )
+    if not ok:
+        return _partial("9router auth failed")
+
+    router9_config["auth_token"] = token
+    router9_config["auth_token_expires_at"] = expires
+    r9.auth_token = token  # Ensure instance variable is set for poll_account()
+
+    # Device code cache reuse
+    if cached_device_code_data and time.time() < cached_device_code_data.get('expires_at_timestamp', 0):
+        device_code = cached_device_code_data['device_code']
+        verify_url = cached_device_code_data['verification_uri_complete']
+        client_id = cached_device_code_data['client_id']
+        client_secret = cached_device_code_data['client_secret']
+        code_verifier = cached_device_code_data['code_verifier']
+        region = cached_device_code_data.get('region', 'us-east-1')
+        user_code = cached_device_code_data.get('user_code', '')
+        device_code_expires_at = cached_device_code_data['expires_at_timestamp']
+        remaining = int(device_code_expires_at - time.time())
+        log(f"Reusing cached device code (user_code: {user_code}, expires in {remaining}s)", "dbg")
+    else:
+        dev = r9.get_device_code(log)
+        if not dev["ok"]:
+            return _partial("device code failed")
+
+        device_code = dev["device_code"]
+        verify_url = dev["verification_uri_complete"]
+        client_id = dev["_clientId"]
+        client_secret = dev["_clientSecret"]
+        code_verifier = dev["codeVerifier"]
+        region = dev.get("_region", "us-east-1")
+        user_code = dev.get("user_code", "")
+        device_code_expires_at = time.time() + 600  # 10 minutes from now
+        log(f"Generated new device code (user_code: {user_code}, expires in 600s)", "dbg")
+
+    log(f"Device code obtained - User code: {user_code}", "info")
+    log(f"Device code obtained - Verification URL: {verify_url[:60]}...", "dbg")
+
+    # Phase 2: Browser automation
+    log(f"Phase 2: Launching browser for device code authorization (headless={headless})", "info")
+
+    async with async_playwright() as p:
+        args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ]
+        if headless:
+            args += ["--disable-gpu", "--no-sandbox"]
+
+        kwargs = {"headless": headless, "args": args}
+        if pw_proxy:
+            kwargs["proxy"] = pw_proxy
+
+        browser = await p.chromium.launch(**kwargs)
+        ctx = await browser.new_context(
+            viewport=fp_config["viewport"],
+            screen=fp_config["screen"],
+            locale=fp_config["locale"],
+            timezone_id=fp_config["timezone"],
+            user_agent=fp_config["user_agent"],
+            device_scale_factor=fp_config["pixel_ratio"],
+        )
+        page = await ctx.new_page()
+        await Stealth().apply_stealth_async(page)
+        await ctx.add_init_script(_build_fingerprint_script(fp_config))
+
+        try:
+            await page.goto(verify_url, timeout=60000)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            except:
+                pass
+            await asyncio.sleep(3)
+            await _dismiss_cookie(page)
+
+            # Wait for automatic redirect to signin page (if no session exists)
+            log("Waiting for signup/signin page...", "info")
+            for _ in range(15):
+                current_url = page.url
+                log(f"Current URL: {current_url}", "dbg")
+                if "signin.aws" in current_url or "profile.aws" in current_url:
+                    break
+                await asyncio.sleep(2)
+
+            log("At registration page", "ok")
+
+            # Fill email if on signin page
+            if "signin.aws" in page.url:
+                log("Looking for email input and Continue button in parallel...", "info")
+
+                # Helper function to find element by trying multiple selectors
+                async def find_element_by_selectors(selectors):
+                    """Try multiple selectors sequentially, return first match."""
+                    for selector in selectors:
+                        try:
+                            loc = page.locator(selector)
+                            await loc.first.wait_for(state="visible", timeout=10000)
+                            return loc.first, selector
+                        except:
+                            continue
+                    return None, None
+
+                # Define selectors
+                email_selectors = [
+                    'input[type="email"]',
+                    'input[autocomplete="username"]',
+                    'input[placeholder*="example.com"]',
+                    'xpath=//input[@type="email"]',
+                ]
+
+                button_selectors = [
+                    'button[type="submit"]',
+                    'button:has-text("Continue")',
+                    '[data-testid*="primary-button"]',
+                ]
+
+                # Locate both elements in parallel
+                results = await asyncio.gather(
+                    find_element_by_selectors(email_selectors),
+                    find_element_by_selectors(button_selectors),
+                    return_exceptions=True
+                )
+
+                # Unpack results safely
+                email_result = results[0] if not isinstance(results[0], Exception) else (None, None)
+                button_result = results[1] if not isinstance(results[1], Exception) else (None, None)
+
+                email_input, email_sel = email_result if isinstance(email_result, tuple) else (None, None)
+                continue_btn, btn_sel = button_result if isinstance(button_result, tuple) else (None, None)
+
+                if email_input:
+                    log(f"Email input field located with selector: {email_sel}", "dbg")
+                if continue_btn:
+                    log(f"Continue button located with selector: {btn_sel}", "dbg")
+
+                if not email_input:
+                    log("Email input field not found after trying all known selectors on registration page", "err")
+                    log(f"Page HTML sample for debugging: {(await page.content())[:500]}", "dbg")
+                    await browser.close()
+                    return _partial("email input not found")
+
+                # Fill email
+                await _move_to_element(page, email_input)
+                await _human_type(page, email_input, email)
+                await _human_delay(0.8, 1.5)
+                log(f"Email filled: {email}", "ok")
+
+                # Click Continue button (already located if found in parallel search)
+                if continue_btn:
+                    await continue_btn.click()
+                    log("Clicked Continue button", "ok")
+                else:
+                    # Fallback: try to find button now if not found in parallel search
+                    log("Continue button not pre-located, searching now...", "warn")
+                    continue_clicked = False
+                    for selector in button_selectors:
+                        try:
+                            btn = page.locator(selector)
+                            if await btn.count() > 0:
+                                await btn.first.click()
+                                continue_clicked = True
+                                log("Clicked Continue button (fallback)", "ok")
+                                break
+                        except:
+                            pass
+
+                    if not continue_clicked:
+                        log("Trying JavaScript fallback for Continue button...", "warn")
+                        await page.evaluate("""() => {
+                            const btns = Array.from(document.querySelectorAll('button'));
+                            const vis = btns.filter(b => b.offsetWidth > 0);
+                            for (const b of vis) {
+                                const t = (b.innerText || '').toLowerCase();
+                                if (t.includes('continue') || t.includes('next')) {
+                                    b.click(); return;
+                                }
+                            }
+                        }""")
+
+                # Monitor API responses after email Continue
+                api_responses = {}
+
+                async def handle_email_response(response):
+                    url = response.url
+                    try:
+                        if '/get-config' in url:
+                            api_responses['get-config'] = {
+                                'status': response.status,
+                                'body': await response.json()
+                            }
+                        elif '/start' in url:
+                            api_responses['start'] = {
+                                'status': response.status,
+                                'body': await response.json()
+                            }
+                    except:
+                        pass
+
+                page.on("response", handle_email_response)
+                await asyncio.sleep(4)
+
+                # Log API responses
+                if 'get-config' in api_responses:
+                    cfg = api_responses['get-config']
+                    log(f"[API] get-config -> {cfg['status']} {json.dumps(cfg['body'], separators=(',', ':'))}", "dbg")
+
+                if 'start' in api_responses:
+                    st = api_responses['start']
+                    log(f"[API] start -> {st['status']} {json.dumps(st['body'], separators=(',', ':'))}", "dbg")
+
+                page.remove_listener("response", handle_email_response)
+
+                # Check if we're on the name input page
+                log("Navigating to name input page after email submission", "info")
+                name_input = None
+                for selector in [
+                    '[data-testid="signup-full-name-input"] input',
+                    'input[type="text"][placeholder*="Silva"]',
+                    'input[type="text"][autocomplete="on"]',
+                ]:
+                    try:
+                        loc = page.locator(selector)
+                        await loc.first.wait_for(state="visible", timeout=5000)
+                        name_input = loc.first
+                        log(f"Name input field located with selector: {selector}", "dbg")
+                        break
+                    except:
+                        continue
+
+                if name_input:
+                    # Fill name
+                    full_name = _generate_name()
+                    log(f"Filling name: {full_name}", "info")
+                    await _move_to_element(page, name_input)
+                    await _human_type(page, name_input, full_name)
+                    await _human_delay(0.8, 1.5)
+                    log(f"Name filled: {full_name}", "ok")
+
+                    # Click Continue button with TES block detection and retry
+                    max_send_otp_retries = 4  # 4 attempts = initial + 3 retries (10s, 30s, 60s)
+                    send_otp_success = False
+
+                    for send_otp_attempt in range(max_send_otp_retries):
+                        log("Looking for Continue button (name page)...", "info")
+
+                        # Set up send-otp response listener
+                        send_otp_response = {}
+
+                        async def handle_sendotp_response(response):
+                            if '/send-otp' in response.url:
+                                try:
+                                    send_otp_response['status'] = response.status
+                                    send_otp_response['body'] = await response.json()
+                                except:
+                                    pass
+
+                        page.on("response", handle_sendotp_response)
+
+                        # Click Continue button
+                        continue_clicked = False
+                        for selector in [
+                            '[data-testid="signup-next-button"]',
+                            'button[type="submit"]',
+                            'button:has-text("Continue")',
+                        ]:
+                            try:
+                                btn = page.locator(selector)
+                                if await btn.count() > 0:
+                                    await btn.first.click()
+                                    continue_clicked = True
+                                    log("Clicked Continue button (name page)", "ok")
+                                    break
+                            except:
+                                pass
+
+                        if not continue_clicked:
+                            log("Trying JavaScript fallback for Continue button (name page)...", "warn")
+                            await page.evaluate("""() => {
+                                const btns = Array.from(document.querySelectorAll('button'));
+                                const vis = btns.filter(b => b.offsetWidth > 0);
+                                for (const b of vis) {
+                                    const t = (b.innerText || '').toLowerCase();
+                                    if (t.includes('continue') || t.includes('next')) {
+                                        b.click(); return;
+                                    }
+                                }
+                            }""")
+
+                        # Wait for send-otp API response
+                        await asyncio.sleep(4)
+                        page.remove_listener("response", handle_sendotp_response)
+
+                        # Check if blocked by TES
+                        if send_otp_response and send_otp_response.get('status') == 400:
+                            body = send_otp_response.get('body', {})
+                            log(f"[API] send-otp -> 400 {json.dumps(body, separators=(',', ':'))}", "dbg")
+
+                            if body.get('errorCode') == 'BLOCKED':
+                                if send_otp_attempt < max_send_otp_retries - 1:
+                                    wait_times = [10, 30, 60]  # 10s, 30s, 60s
+                                    wait_time = wait_times[send_otp_attempt] if send_otp_attempt < len(wait_times) else 60
+                                    log(f"AWS TES blocked send-otp, retrying in {wait_time}s (attempt {send_otp_attempt + 2}/{max_send_otp_retries})", "warn")
+                                    await asyncio.sleep(wait_time)
+                                    continue  # Retry Continue button click
+                                else:
+                                    log(f"AWS TES blocked registration after {max_send_otp_retries} retry attempts", "err")
+                                    await browser.close()
+                                    return _partial("Blocked by AWS TES")
+                            else:
+                                # Other 400 error, not TES block
+                                send_otp_success = True
+                                break
+                        else:
+                            # Success or no response captured
+                            if send_otp_response:
+                                status = send_otp_response.get('status', '?')
+                                body = send_otp_response.get('body', {})
+                                log(f"[API] send-otp -> {status} {json.dumps(body, separators=(',', ':'))}", "dbg")
+                            send_otp_success = True
+                            break
+
+                    if not send_otp_success:
+                        log("Failed to navigate past name input page after form submission", "err")
+                        await browser.close()
+                        return _partial("Name page navigation failed")
+                else:
+                    log("No name input page detected, proceeding to OTP...", "info")
+
+            # Phase 2.1: OTP verification (automated)
+            log("Waiting for OTP verification page...", "info")
+            await asyncio.sleep(3)
+
+            # Find OTP input
+            otp_input = None
+            for selector in [
+                '[data-testid="email-verification-form-code-input"]',
+                'input[placeholder*="6-digit"]',
+                'input[type="text"][autocomplete="on"]',
+                'input[inputmode="numeric"]',
+            ]:
+                try:
+                    loc = page.locator(selector)
+                    await loc.first.wait_for(state="visible", timeout=10000)
+                    otp_input = loc.first
+                    log(f"Found OTP input with selector: {selector}", "ok")
+                    break
+                except:
+                    continue
+
+            if not otp_input:
+                log("OTP input field not found on verification page after trying all known selectors", "err")
+                await browser.close()
+                return _partial("OTP input not found")
+
+            # Get OTP from email
+            log("Waiting for OTP code from email...", "info")
+            log(f"Mail provider: {mail_provider_instance.__class__.__name__}", "dbg")
+            otp_code = ""
+            otp_deadline = time.time() + 90
+            while time.time() < otp_deadline:
+                if cancel_check and cancel_check():
+                    await browser.close()
+                    return None
+                try:
+                    otp_code = mail_provider_instance.wait_otp(timeout=5, poll_interval=3)
+                    if otp_code:
+                        break
+                except Exception as e:
+                    log(f"OTP polling error: {e}", "warn")
+                    import traceback
+                    traceback.print_exc()
+
+            if not otp_code:
+                # Try to resend OTP and retry once
+                log("No OTP received, attempting to resend...", "warn")
+                resend_clicked = False
+
+                # Look for Resend button
+                for selector in [
+                    'button:has-text("Resend")',
+                    'button:has-text("Send again")',
+                    'a:has-text("Resend code")',
+                    'a:has-text("Didn\'t receive")',
+                ]:
+                    try:
+                        btn = page.locator(selector)
+                        if await btn.count() > 0:
+                            await btn.first.click()
+                            resend_clicked = True
+                            log("Resend OTP button clicked, waiting for new code", "info")
+                            await asyncio.sleep(3)
+                            break
+                    except:
+                        pass
+
+                if resend_clicked:
+                    # Retry waiting for OTP (60s second attempt)
+                    log("Waiting for OTP code to arrive after resend request (60s timeout)", "info")
+                    otp_deadline = time.time() + 60
+                    while time.time() < otp_deadline:
+                        if cancel_check and cancel_check():
+                            await browser.close()
+                            return None
+                        try:
+                            otp_code = mail_provider_instance.wait_otp(timeout=5, poll_interval=3)
+                            if otp_code:
+                                log(f"OTP received after resend: {otp_code}", "ok")
+                                break
+                        except Exception as e:
+                            log(f"OTP polling error after resend: {e}", "warn")
+                            import traceback
+                            traceback.print_exc()
+
+                if not otp_code:
+                    log("OTP code not received within timeout even after resend attempt", "err")
+                    await browser.close()
+                    return _partial("OTP timeout")
+
+            log(f"OTP code received from mail provider: {otp_code}", "info")
+
+            # Fill OTP
+            await _move_to_element(page, otp_input)
+            await otp_input.click()
+            await asyncio.sleep(0.3)
+            for ch in otp_code:
+                await page.keyboard.press(ch)
+                await asyncio.sleep(0.05 + 0.1 * secrets.randbelow(10) / 10)
+
+            log("OTP filled", "ok")
+
+            # Click Continue button (OTP page)
+            log("Looking for Continue button (OTP page)...", "info")
+            continue_clicked = False
+            for selector in [
+                '[data-testid="email-verification-verify-button"]',
+                'button[type="submit"]',
+                'button:has-text("Continue")',
+            ]:
+                try:
+                    btn = page.locator(selector)
+                    if await btn.count() > 0:
+                        await btn.first.click()
+                        continue_clicked = True
+                        log("Clicked Continue button (OTP page)", "ok")
+                        break
+                except:
+                    pass
+
+            if not continue_clicked:
+                log("Trying JavaScript fallback for Continue button (OTP page)...", "warn")
+                await page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const vis = btns.filter(b => b.offsetWidth > 0);
+                    for (const b of vis) {
+                        const t = (b.innerText || '').toLowerCase();
+                        if (t.includes('continue') || t.includes('verify')) {
+                            b.click(); return;
+                        }
+                    }
+                }""")
+
+            await asyncio.sleep(3)
+
+            # Phase 2.2: Password creation (automated)
+            log("Waiting for password creation page...", "info")
+
+            # Wait for password page to load and find input (with retry)
+            password_input = None
+            password_deadline = time.time() + 60  # 60 second timeout
+            attempt = 0
+
+            while time.time() < password_deadline and not password_input:
+                attempt += 1
+                if attempt > 1:
+                    log(f"Retry {attempt} - waiting for password input page to appear", "info")
+                    await asyncio.sleep(3)
+
+                for selector in [
+                    '[data-testid="test-input"] input',
+                    'input[type="password"][placeholder*="password"]',
+                    'input[type="password"]',
+                ]:
+                    try:
+                        loc = page.locator(selector).first
+                        await loc.wait_for(state="visible", timeout=5000)  # 5 second timeout per selector
+                        password_input = loc
+                        log(f"Password input field located with selector: {selector}", "dbg")
+                        break
+                    except:
+                        continue
+
+                if password_input:
+                    break
+
+            if not password_input:
+                log("Password input field not found after multiple retry attempts", "err")
+                await browser.close()
+                return _partial("Password input not found")
+
+            # Generate password
+            password = _generate_password()
+            log(f"Filling generated password into input field (length: {len(password)})", "info")
+
+            # Fill password
+            await _move_to_element(page, password_input)
+            await _human_type(page, password_input, password)
+            await _human_delay(0.5, 1.0)
+
+            # Find confirm password input (with retry)
+            confirm_input = None
+            confirm_deadline = time.time() + 30  # 30 second timeout
+            attempt = 0
+
+            while time.time() < confirm_deadline and not confirm_input:
+                attempt += 1
+                if attempt > 1:
+                    log(f"Retry {attempt} - waiting for confirm password field...", "info")
+                    await asyncio.sleep(2)
+
+                for selector in [
+                    '[data-testid="test-retype-input"] input',
+                    'input[type="password"][placeholder*="Re-enter"]',
+                    'input[type="password"][placeholder*="Confirm"]',
+                ]:
+                    try:
+                        loc = page.locator(selector).first
+                        await loc.wait_for(state="visible", timeout=3000)
+                        confirm_input = loc
+                        log(f"Found confirm password input with selector: {selector}", "ok")
+                        break
+                    except:
+                        continue
+
+                if confirm_input:
+                    break
+
+            if not confirm_input:
+                log("Confirm password input field not found after multiple retry attempts", "err")
+                await browser.close()
+                return _partial("Confirm password input not found")
+
+            # Fill confirm password
+            await _move_to_element(page, confirm_input)
+            await _human_type(page, confirm_input, password)
+            await _human_delay(0.8, 1.5)
+            log("Password filled", "ok")
+
+            # Click Continue button (password page)
+            log("Looking for Continue button (password page)...", "info")
+            continue_clicked = False
+            for selector in [
+                '[data-testid="test-primary-button"]',
+                'button[type="submit"]',
+                'button:has-text("Continue")',
+            ]:
+                try:
+                    btn = page.locator(selector)
+                    if await btn.count() > 0:
+                        await btn.first.click()
+                        continue_clicked = True
+                        log("Continue button clicked on password page to proceed", "info")
+                        break
+                except:
+                    pass
+
+            if not continue_clicked:
+                log("Continue button not found via selectors, attempting JavaScript fallback on password page", "warn")
+                await page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const vis = btns.filter(b => b.offsetWidth > 0);
+                    for (const b of vis) {
+                        const t = (b.innerText || '').toLowerCase();
+                        if (t.includes('continue')) {
+                            b.click(); return;
+                        }
+                    }
+                }""")
+
+            await asyncio.sleep(3)
+
+            # Phase 2.3: Device authorization (automated)
+            log("Waiting for device code confirmation page...", "info")
+            await asyncio.sleep(3)
+
+            # Step 1: Confirm device code
+            confirm_button = None
+            for selector in [
+                '#cli_verification_btn',
+                'button[data-analytics="accept-user-code"]',
+                'button:has-text("Confirm and continue")',
+            ]:
+                try:
+                    btn = page.locator(selector)
+                    await btn.first.wait_for(state="visible", timeout=10000)
+                    confirm_button = btn.first
+                    log(f"Device code confirmation button located with selector: {selector}", "dbg")
+                    break
+                except:
+                    continue
+
+            if not confirm_button:
+                log("Device code confirmation button not found on authorization page", "err")
+                await browser.close()
+                return _partial("Device code confirmation button not found")
+
+            await confirm_button.click()
+            log("Clicked 'Confirm and continue'", "ok")
+            await asyncio.sleep(3)
+
+            # Step 2: Allow access to Kiro
+            log("Waiting for authorization consent page...", "info")
+            allow_button = None
+            for selector in [
+                '[data-testid="allow-access-button"]',
+                'button[data-analytics="consent-allow-access"]',
+                'button:has-text("Allow access")',
+            ]:
+                try:
+                    btn = page.locator(selector)
+                    await btn.first.wait_for(state="visible", timeout=10000)
+                    allow_button = btn.first
+                    log(f"'Allow access' button located with selector: {selector}", "dbg")
+                    break
+                except:
+                    continue
+
+            if not allow_button:
+                log("'Allow access' button not found on OAuth consent page", "err")
+                await browser.close()
+                return _partial("Allow access button not found")
+
+            await allow_button.click()
+            log("Clicked 'Allow access'", "ok")
+            await asyncio.sleep(1)
+            await browser.close()
+            log("Playwright browser session closed successfully", "dbg")
+
+        except Exception as e:
+            log(f"Browser automation error during registration flow: {e}", "err")
+            await browser.close()
+            return _partial(f"browser: {e}")
+
+    # Phase 3: Poll 9router
+    log("Phase 3: Polling 9router API for account export completion", "info")
+    poll = r9.poll_account(device_code, client_id, client_secret, code_verifier, log, 3)
+
+    exported = poll["ok"]
+    if exported:
+        log("✅ Exported to 9router!", "ok")
+    else:
+        log(f"⚠️  Export failed: {poll.get('error', 'unknown')}", "warn")
+        # Export failed = incomplete registration
+        await browser.close()
+        return _partial("9router export failed")
+
+    # Phase 4: Local tokens
+    if auto_login:
+        try:
+            persist_tokens(client_id, client_secret, "", "", 28800, log, email=email)
+            if skip_onboard:
+                skip_onboarding(log)
+        except Exception as e:
+            log(f"Token injection warning (non-fatal): {e}", "warn")
+
+    log("=" * 40, "info")
+    log("9router OAuth device code registration completed successfully!", "ok")
+    log(f"  Account Email: {email}", "info")
+    log(f"  9router Export Status: {exported}", "info")
+    log("=" * 40, "info")
+
+    return {
+        "email": email,
+        "password": password,
+        "full_name": full_name,
+        "provider": "BuilderId",
+        "authMethod": "IdC",
+        "region": region,
+        "clientId": client_id,
+        "clientSecret": client_secret,
+        "clientIdHash": _sha1_hash(client_id),
+        "accessToken": "",
+        "refreshToken": "",
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y/%m/%d %H:%M:%S"),
+        "router9_exported": exported,
+        "device_code_info": {
+            "device_code": device_code,
+            "verification_uri_complete": verify_url,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code_verifier": code_verifier,
+            "region": region,
+            "user_code": user_code,
+            "expires_at_timestamp": device_code_expires_at,
+        },
     }
