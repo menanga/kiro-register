@@ -38,4 +38,4 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 # In Dokploy's Command field override with:
 #   python service.py --service --delay 300 --no-headless
 # The entrypoint will automatically prepend xvfb-run when --no-headless is present.
-CMD ["python", "service.py", "--service", "--delay", "300", "--headless"]
+CMD ["python", "service.py", "--service", "--delay", "300", "--9router"]

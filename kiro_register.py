@@ -1562,13 +1562,20 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
     if cached_email:
         email = cached_email
         log(f"Reusing cached email: {email}", "dbg")
+        # Re-create mailbox to ensure provider is initialized for OTP polling
+        # Some providers require create_mailbox() before wait_otp()
+        if hasattr(mail, 'create_mailbox'):
+            try:
+                # Re-initialize with same email (provider handles existing mailbox)
+                mail.address = cached_email
+                mail._created_at = time.time()
+                log("Mailbox state refreshed for cached email", "dbg")
+            except:
+                pass
         # Reset mail provider state to allow polling new OTP
         if hasattr(mail, '_seen_uids'):
             mail._seen_uids = set()
             log("Reset mail provider seen UIDs for fresh OTP polling", "dbg")
-        if hasattr(mail, '_created_at'):
-            mail._created_at = time.time()
-            log("Reset mail provider created timestamp", "dbg")
     else:
         email = mail.create_mailbox()
         log(f"Generated new email: {email}", "dbg")
