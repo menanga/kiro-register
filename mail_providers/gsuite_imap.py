@@ -155,7 +155,7 @@ class GsuiteImapProvider(MailProvider):
         self._seen_uids = set()
         return self.address
 
-    def wait_otp(self, timeout: int = 120, poll_interval: int = 3) -> str:
+    def wait_otp(self, timeout: int = 120, poll_interval: int = 1) -> str:
         import sys
 
         if not self.address:
@@ -306,14 +306,30 @@ class GsuiteImapProvider(MailProvider):
                 # subject, e.g. "Your verification code is 123456").
                 m = re.search(r"\b(\d{6})\b", subject)
                 if m:
-                    print(f"[IMAP DEBUG]   FOUND OTP in subject: {m.group(1)}", flush=True)
-                    return m.group(1)
+                    otp_code = m.group(1)
+                    print(f"[IMAP DEBUG]   FOUND OTP in subject: {otp_code}", flush=True)
+                    # Delete email after extracting OTP (like grok flow)
+                    try:
+                        imap.uid("STORE", uid, "+FLAGS", "\\Deleted")
+                        imap.expunge()
+                        print(f"[IMAP DEBUG]   Deleted OTP email UID:{uid}", flush=True)
+                    except Exception as e:
+                        print(f"[IMAP DEBUG]   Failed to delete email: {e}", flush=True)
+                    return otp_code
 
                 for body in _extract_bodies(msg):
                     m = re.search(r"\b(\d{6})\b", body)
                     if m:
-                        print(f"[IMAP DEBUG]   FOUND OTP in body: {m.group(1)}", flush=True)
-                        return m.group(1)
+                        otp_code = m.group(1)
+                        print(f"[IMAP DEBUG]   FOUND OTP in body: {otp_code}", flush=True)
+                        # Delete email after extracting OTP (like grok flow)
+                        try:
+                            imap.uid("STORE", uid, "+FLAGS", "\\Deleted")
+                            imap.expunge()
+                            print(f"[IMAP DEBUG]   Deleted OTP email UID:{uid}", flush=True)
+                        except Exception as e:
+                            print(f"[IMAP DEBUG]   Failed to delete email: {e}", flush=True)
+                        return otp_code
 
                 print(f"[IMAP DEBUG]   No 6-digit code found in this message", flush=True)
 

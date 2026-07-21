@@ -12,7 +12,10 @@
       "Bash(Select-String -Pattern \"from.*kiro_register|import.*kiro_register\")",
       "Bash(Select-Object -ExpandProperty Path -Unique)",
       "Bash(python -m py_compile mail_providers/gsuite_imap.py)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(env)",
+      "Bash(pip list *)",
+      "Bash(pip3 list *)"
     ],
     "allowed": [
       "python *",

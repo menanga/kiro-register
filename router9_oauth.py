@@ -392,7 +392,7 @@ class Router9OAuthClient:
                 retryable = e.code in [408, 429, 500, 502, 503, 504]
 
                 if retryable and attempt < max_retries:
-                    wait_time = 2 ** attempt  # Exponential backoff: 2s, 4s, 8s
+                    wait_time = 5  # Fixed 5s delay (like grok)
                     log(f"   Retrying in {wait_time} seconds (attempt {attempt + 1}/{max_retries})...", "warn")
                     time.sleep(wait_time)
                     continue
@@ -410,7 +410,7 @@ class Router9OAuthClient:
                 retryable = True
 
                 if attempt < max_retries:
-                    wait_time = 2 ** attempt
+                    wait_time = 5  # Fixed 5s delay (like grok)
                     log(f"Retrying in {wait_time} seconds...", "warn")
                     time.sleep(wait_time)
                     continue

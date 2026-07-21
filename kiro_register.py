@@ -339,6 +339,14 @@ async def _human_type(page, locator, text, min_delay=35, max_delay=120):
     await asyncio.sleep(_random.uniform(0.3, 0.8))
 
 
+async def _fast_type(page, locator, text):
+    """Fast form fill with minimal delay (optimized for speed)."""
+    await locator.click()
+    await asyncio.sleep(0.1)
+    await locator.fill(text)
+    await asyncio.sleep(0.2)
+
+
 async def _human_delay(min_s=1.0, max_s=3.0):
     """Random sleep to approximate human reaction time."""
     await asyncio.sleep(_random.uniform(min_s, max_s))
@@ -808,13 +816,13 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
             except Exception:
                 pass
-            await asyncio.sleep(3)
+            await asyncio.sleep(1.5)  # Reduced from 3s
             await _dismiss_cookie(page)
 
             # Click the AWS Builder ID button.
             if "app.kiro.dev" in page.url:
                 log("Selecting sign-in method...")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)  # Reduced from 2s
                 signin_clicked = False
                 for sel in [
                     'xpath=//*[@id="layout-viewport"]/div/div/div/div[2]/div/div[1]/button[3]',
@@ -834,7 +842,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                         pass
 
                 if signin_clicked:
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(1.5)  # Reduced from 3s
                     if not CallbackHandler.signin_callback_params:
                         try:
                             await page.evaluate("""() => {
@@ -875,7 +883,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                 if "signin.aws" in page.url or "profile.aws" in page.url:
                     break
                 await asyncio.sleep(2)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # Reduced from 2s
             log("Arrived at the registration page", "ok")
 
             # On signin.aws, fill the email.
@@ -885,7 +893,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                     email_input = page.locator('xpath=//input[@type="text"]').first
                 await _move_to_element(page, email_input)
                 await _human_type(page, email_input, email)
-                await _human_delay(0.8, 1.5)
+                # Removed unnecessary delay
                 log(f"Email filled: {email}")
                 await page.evaluate("""() => {
                     const buttons = Array.from(document.querySelectorAll('button'));
@@ -1006,7 +1014,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
 
             # Phase 3: name entry
             log("Phase 3: filling the registration form")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # Reduced from 2s
             await _dismiss_cookie(page)
 
             state = await wait_for_state(["EMAIL", "NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
@@ -1023,7 +1031,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                 if await email_input.count() > 0:
                     await _move_to_element(page, email_input.first)
                     await _human_type(page, email_input.first, email)
-                    await _human_delay(0.5, 1.0)
+                    # Removed unnecessary delay
                     log(f"Email filled (state machine fallback): {email}", "ok")
                     await page.evaluate("""() => {
                         const buttons = Array.from(document.querySelectorAll('button'));
@@ -1049,7 +1057,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                     try:
                         await _move_to_element(page, name_field.first)
                         await _human_type(page, name_field.first, full_name)
-                        await _human_delay(0.5, 1.0)
+                        # Removed unnecessary delay - check value immediately
                         filled_val = await name_field.first.input_value()
                         if filled_val == full_name:
                             log(f"Name filled: '{full_name}'", "ok")
@@ -1096,7 +1104,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
             if state == "OTP":
                 log("Phase 4: OTP verification")
                 # Give the profile.aws React view time to finish rendering.
-                await asyncio.sleep(3)
+                await asyncio.sleep(1.5)  # Reduced from 3s
                 otp_selectors = [
                     'xpath=//input[@inputmode="numeric"]',
                     'xpath=//input[@autocomplete="one-time-code"]',
@@ -1133,7 +1141,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                         break
                     if retry < 2:
                         log(f"OTP input not ready yet; retrying ({retry+1}/3)...")
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1)  # Reduced from 2s
 
                 if not otp_input:
                     # Debug: dump attributes of every input on the page.
@@ -1288,7 +1296,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
 
             if state == "PASSWORD":
                 log("Phase 5: setting password")
-                await _human_delay(1.5, 3.0)
+                await _human_delay(0.8, 1.5)  # Reduced from 1.5-3.0
                 for _wait in range(10):
                     count = await page.locator('xpath=//input[@type="password"]').count()
                     if count >= 2:
@@ -1322,9 +1330,9 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                             if (visible.length > 0) visible[visible.length - 1].click();
                         }""")
                     except Exception:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1)  # Reduced from 2s
                         continue
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2.5)  # Reduced from 5s
                     new_state = await detect_state()
                     if new_state != "PASSWORD":
                         log("Password set", "ok")
@@ -1341,7 +1349,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                 return _partial_result("user cancelled")
             if state == "CONSENT":
                 log("Phase 6: authorisation consent screen")
-                await asyncio.sleep(3)
+                await asyncio.sleep(1.5)  # Reduced from 3s
                 for attempt in range(10):
                     try:
                         clicked = await page.evaluate("""() => {
@@ -1362,7 +1370,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                         break
                     if clicked:
                         log("Clicked the authorise button", "ok")
-                        await asyncio.sleep(4)
+                        await asyncio.sleep(2)  # Reduced from 4s
                         try:
                             new_state = await detect_state()
                         except Exception:
@@ -1371,7 +1379,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                         if new_state != "CONSENT":
                             state = new_state
                             break
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)  # Reduced from 2s
 
             # Wait for the OAuth callback code.
             log("Waiting for OAuth callback...")
@@ -1410,7 +1418,7 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                         }""")
                     except Exception:
                         pass
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)  # Reduced from 2s
 
             await browser.close()
     finally:
@@ -1621,17 +1629,25 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             return _partial("device code failed")
 
         device_code = dev["device_code"]
-        verify_url = dev["verification_uri_complete"]
+        verify_url_raw = dev["verification_uri_complete"]
         client_id = dev["_clientId"]
         client_secret = dev["_clientSecret"]
         code_verifier = dev["codeVerifier"]
         region = dev.get("_region", "us-east-1")
         user_code = dev.get("user_code", "")
         device_code_expires_at = time.time() + 600  # 10 minutes from now
+
+        # Fix malformed verification URL from 9router API
+        if user_code and "#/device?user_code=" not in verify_url_raw:
+            verify_url = f"https://view.awsapps.com/start/#/device?user_code={user_code}"
+            log(f"Corrected malformed verification URL → {verify_url}", "warn")
+        else:
+            verify_url = verify_url_raw
+
         log(f"Generated new device code (user_code: {user_code}, expires in 600s)", "dbg")
 
     log(f"Device code obtained - User code: {user_code}", "info")
-    log(f"Device code obtained - Verification URL: {verify_url[:60]}...", "dbg")
+    log(f"Device code obtained - Verification URL: {verify_url}", "dbg")
 
     # Phase 2: Browser automation
     log(f"Phase 2: Launching browser for device code authorization (headless={headless})", "info")
@@ -1691,7 +1707,11 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     for selector in selectors:
                         try:
                             loc = page.locator(selector)
-                            await loc.first.wait_for(state="visible", timeout=10000)
+                            # Quick check first - element might already be visible
+                            if await loc.first.is_visible():
+                                return loc.first, selector
+                            # Only wait if not immediately visible
+                            await loc.first.wait_for(state="visible", timeout=3000)  # Reduced from 10s
                             return loc.first, selector
                         except:
                             continue
@@ -1739,7 +1759,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                 # Fill email
                 await _move_to_element(page, email_input)
                 await _human_type(page, email_input, email)
-                await _human_delay(0.8, 1.5)
+                # Removed unnecessary delay - button already loaded
                 log(f"Email filled: {email}", "ok")
 
                 # Click Continue button (already located if found in parallel search)
@@ -1817,7 +1837,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                 ]:
                     try:
                         loc = page.locator(selector)
-                        await loc.first.wait_for(state="visible", timeout=5000)
+                        # Quick check first
+                        if await loc.first.is_visible():
+                            name_input = loc.first
+                            log(f"Name input field located with selector: {selector}", "dbg")
+                            break
+                        # Only wait if not immediately visible
+                        await loc.first.wait_for(state="visible", timeout=3000)
                         name_input = loc.first
                         log(f"Name input field located with selector: {selector}", "dbg")
                         break
@@ -1830,7 +1856,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     log(f"Filling name: {full_name}", "info")
                     await _move_to_element(page, name_input)
                     await _human_type(page, name_input, full_name)
-                    await _human_delay(0.8, 1.5)
+                    # Removed unnecessary delay - button already loaded
                     log(f"Name filled: {full_name}", "ok")
 
                     # Click Continue button with TES block detection and retry
@@ -1937,7 +1963,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             ]:
                 try:
                     loc = page.locator(selector)
-                    await loc.first.wait_for(state="visible", timeout=10000)
+                    # Quick check first
+                    if await loc.first.is_visible():
+                        otp_input = loc.first
+                        log(f"Found OTP input with selector: {selector}", "ok")
+                        break
+                    # Only wait if not immediately visible
+                    await loc.first.wait_for(state="visible", timeout=3000)
                     otp_input = loc.first
                     log(f"Found OTP input with selector: {selector}", "ok")
                     break
@@ -1985,7 +2017,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                             await btn.first.click()
                             resend_clicked = True
                             log("Resend OTP button clicked, waiting for new code", "info")
-                            await asyncio.sleep(3)
+                            await asyncio.sleep(1.5)  # Reduced from 3s
                             break
                     except:
                         pass
@@ -2079,7 +2111,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                 ]:
                     try:
                         loc = page.locator(selector).first
-                        await loc.wait_for(state="visible", timeout=5000)  # 5 second timeout per selector
+                        # Quick check first
+                        if await loc.is_visible():
+                            password_input = loc
+                            log(f"Password input field located with selector: {selector}", "dbg")
+                            break
+                        # Only wait if not immediately visible
+                        await loc.wait_for(state="visible", timeout=2000)  # Reduced from 5s
                         password_input = loc
                         log(f"Password input field located with selector: {selector}", "dbg")
                         break
@@ -2101,7 +2139,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             # Fill password
             await _move_to_element(page, password_input)
             await _human_type(page, password_input, password)
-            await _human_delay(0.5, 1.0)
+            # Removed unnecessary delay
 
             # Find confirm password input (with retry)
             confirm_input = None
@@ -2121,7 +2159,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                 ]:
                     try:
                         loc = page.locator(selector).first
-                        await loc.wait_for(state="visible", timeout=3000)
+                        # Quick check first
+                        if await loc.is_visible():
+                            confirm_input = loc
+                            log(f"Found confirm password input with selector: {selector}", "ok")
+                            break
+                        # Only wait if not immediately visible
+                        await loc.wait_for(state="visible", timeout=2000)  # Reduced from 3s
                         confirm_input = loc
                         log(f"Found confirm password input with selector: {selector}", "ok")
                         break
@@ -2139,7 +2183,7 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             # Fill confirm password
             await _move_to_element(page, confirm_input)
             await _human_type(page, confirm_input, password)
-            await _human_delay(0.8, 1.5)
+            # Removed unnecessary delay - button already loaded
             log("Password filled", "ok")
 
             # Click Continue button (password page)
@@ -2188,7 +2232,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             ]:
                 try:
                     btn = page.locator(selector)
-                    await btn.first.wait_for(state="visible", timeout=10000)
+                    # Quick check first
+                    if await btn.first.is_visible():
+                        confirm_button = btn.first
+                        log(f"Device code confirmation button located with selector: {selector}", "dbg")
+                        break
+                    # Only wait if not immediately visible
+                    await btn.first.wait_for(state="visible", timeout=3000)  # Reduced from 10s
                     confirm_button = btn.first
                     log(f"Device code confirmation button located with selector: {selector}", "dbg")
                     break
@@ -2214,7 +2264,13 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             ]:
                 try:
                     btn = page.locator(selector)
-                    await btn.first.wait_for(state="visible", timeout=10000)
+                    # Quick check first
+                    if await btn.first.is_visible():
+                        allow_button = btn.first
+                        log(f"'Allow access' button located with selector: {selector}", "dbg")
+                        break
+                    # Only wait if not immediately visible
+                    await btn.first.wait_for(state="visible", timeout=3000)  # Reduced from 10s
                     allow_button = btn.first
                     log(f"'Allow access' button located with selector: {selector}", "dbg")
                     break

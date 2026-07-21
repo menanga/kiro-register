@@ -23,8 +23,12 @@ from urllib.parse import urlparse
 
 import kiro_register
 import mail_providers
+from proxy_pool import load_proxy_pool_from_env
 
 logger = logging.getLogger("kiro-service")
+
+# Global proxy pool instance
+_proxy_pool = None
 
 DEFAULT_CFG = {
     "mail_provider": "gsuite_imap",
@@ -113,7 +117,7 @@ def _resolve_domains_path(cfg: dict, config_path: Path) -> Path:
 
 
 def load_configuration() -> tuple[dict, Path]:
-    config_path = Path(os.environ.get("CONFIG_PATH", "/config/kiro_config.json"))
+    config_path = Path(os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "kiro_config.json")))
     cfg = dict(DEFAULT_CFG)
     if config_path.exists():
         try:
@@ -253,7 +257,7 @@ def log_callback(msg, level="info"):
 
 
 def _db_path() -> Path | None:
-    raw = os.environ.get("DB_PATH", "/data/accounts.db")
+    raw = os.environ.get("DB_PATH", str(Path(__file__).parent / "accounts.db"))
     if not raw:
         return None
     return Path(raw)
@@ -330,44 +334,110 @@ def persist_account(result: dict):
 
 
 async def run_account(cfg: dict, config_path: Path, use_9router: bool, proxy_url: str, headless: bool):
-    provider = build_mail_provider(cfg, config_path)
+    global _proxy_pool
 
-    if use_9router:
-        router9_config = {
-            "base_url": cfg.get("router9_url", ""),
-            "password": cfg.get("router9_password", ""),
-            "auth_token": cfg.get("router9_auth_token", ""),
-            "auth_token_expires_at": cfg.get("router9_auth_token_expires_at", ""),
-        }
-        if not router9_config["base_url"] or not router9_config["password"]:
-            raise ValueError("router9_url and router9_password are required for --9router mode")
-        result = await kiro_register.register_via_9router_oauth(
-            headless=headless,
-            auto_login=True,
-            skip_onboard=True,
-            mail_provider_instance=provider,
-            router9_config=router9_config,
-            proxy_url=proxy_url,
-            log=log_callback,
-        )
-    else:
-        result = await kiro_register.register(
-            headless=headless,
-            auto_login=True,
-            skip_onboard=True,
-            mail_provider_instance=provider,
-            proxy_url=proxy_url,
-            log=log_callback,
-        )
+    MAX_RETRIES = 3
+    cached_email = None
+    cached_device_code = None
+    last_result = None
 
-    incomplete = bool(result.get("incomplete"))
-    email = result.get("email", "N/A")
-    if incomplete:
-        logger.warning("Partial result for %s: %s", email, result.get("failReason"))
-    else:
-        logger.info("Success for %s", email)
-    persist_account(result)
-    return result
+    for attempt in range(1, MAX_RETRIES + 1):
+        # Get random proxy from pool if available
+        active_proxy = None
+        if _proxy_pool:
+            active_proxy = _proxy_pool.get_random_proxy()
+            if active_proxy:
+                logger.info(f"Using proxy from pool: {active_proxy}")
+            else:
+                logger.warning("No available proxies in pool - running direct")
+        elif proxy_url:
+            # Fallback to single proxy from config/args
+            active_proxy = proxy_url
+            logger.info(f"Using configured proxy: {active_proxy}")
+
+        try:
+            provider = build_mail_provider(cfg, config_path)
+
+            if use_9router:
+                router9_config = {
+                    "base_url": cfg.get("router9_url", ""),
+                    "password": cfg.get("router9_password", ""),
+                    "auth_token": cfg.get("router9_auth_token", ""),
+                    "auth_token_expires_at": cfg.get("router9_auth_token_expires_at", ""),
+                }
+                if not router9_config["base_url"] or not router9_config["password"]:
+                    raise ValueError("router9_url and router9_password are required for --9router mode")
+                result = await kiro_register.register_via_9router_oauth(
+                    headless=headless,
+                    auto_login=True,
+                    skip_onboard=True,
+                    mail_provider_instance=provider,
+                    router9_config=router9_config,
+                    proxy_url=active_proxy,
+                    log=log_callback,
+                    cached_email=cached_email,
+                    cached_device_code_data=cached_device_code,
+                )
+            else:
+                result = await kiro_register.register(
+                    headless=headless,
+                    auto_login=True,
+                    skip_onboard=True,
+                    mail_provider_instance=provider,
+                    proxy_url=active_proxy,
+                    log=log_callback,
+                )
+
+            last_result = result
+            incomplete = bool(result.get("incomplete"))
+            email = result.get("email", "N/A")
+
+            # Success if router9_exported=True or incomplete=False
+            if not incomplete:
+                logger.info("✓ Success for %s (attempt %d/%d)", email, attempt, MAX_RETRIES)
+                # Report proxy success (keeps failure history)
+                if _proxy_pool and active_proxy:
+                    _proxy_pool.report_success(active_proxy)
+                persist_account(result)
+                return result
+
+            # Incomplete - report proxy failure
+            if _proxy_pool and active_proxy:
+                _proxy_pool.report_failure(active_proxy)
+
+            # Cache for retry
+            cached_email = result.get("email")
+            if "device_code_info" in result:
+                cached_device_code = result["device_code_info"]
+
+            fail_reason = result.get("failReason", "unknown")
+            logger.warning("⚠ Incomplete registration for %s: %s (attempt %d/%d)", email, fail_reason, attempt, MAX_RETRIES)
+
+            # Retry delays: 5s, 10s, 15s
+            if attempt < MAX_RETRIES:
+                delay = 5 * attempt
+                logger.info("Retrying in %ds...", delay)
+                await asyncio.sleep(delay)
+
+        except Exception as e:
+            logger.error("✗ Registration exception (attempt %d/%d): %s", attempt, MAX_RETRIES, e)
+
+            # Report proxy failure on exception
+            if _proxy_pool and active_proxy:
+                _proxy_pool.report_failure(active_proxy)
+
+            if attempt < MAX_RETRIES:
+                delay = 5 * attempt
+                logger.info("Retrying in %ds...", delay)
+                await asyncio.sleep(delay)
+
+    # Final failure - persist last result if available
+    if last_result:
+        persist_account(last_result)
+        return last_result
+
+    # No result at all
+    return {"incomplete": True, "failReason": "max retries exceeded", "email": "N/A"}
 
 
 def parse_args(argv=None):
@@ -384,18 +454,26 @@ def parse_args(argv=None):
     parser.add_argument("--9router", "--nine-router", dest="nine_router", action="store_true", help="Use 9router OAuth device-code flow")
     parser.add_argument("--proxy", default=os.environ.get("PROXY_URL", ""), help="Proxy URL, e.g. http://user:pass@host:port")
     parser.add_argument("--provider", default=os.environ.get("MAIL_PROVIDER", ""), help="Mail provider: gsuite_imap | shiromail | yydsmail")
-    parser.add_argument("--config", default=os.environ.get("CONFIG_PATH", "/config/kiro_config.json"), help="Path to kiro_config.json")
+    parser.add_argument("--config", default=os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "kiro_config.json")), help="Path to kiro_config.json")
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
     return parser.parse_args(argv)
 
 
 async def main():
+    global _proxy_pool
+
     args = parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
+
+    # Initialize proxy pool from PROXIES env
+    _proxy_pool = load_proxy_pool_from_env()
+    if _proxy_pool:
+        stats = _proxy_pool.get_stats()
+        logger.info(f"Proxy pool loaded: {stats['total']} proxies, {stats['available']} available")
 
     os.environ.setdefault("APPDATA", "/data")
     if args.config:

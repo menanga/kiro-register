@@ -34,3 +34,4 @@ dist/
 # Local secrets (credentials live here)
 kiro_config.json
 /.claude
+/.env
