@@ -172,6 +172,7 @@ async def fill_stripe_checkout(payment_url, card_info, cdk_code, log=log, headle
                     await page.goto(payment_url, timeout=60000, wait_until="commit")
                 except Exception:
                     log("Checkout page could not be loaded", "error")
+                    await browser.close()
                     return {"ok": False, "status": "error", "message": "page load failed"}
 
             # Wait for the form to render
@@ -179,6 +180,7 @@ async def fill_stripe_checkout(payment_url, card_info, cdk_code, log=log, headle
                 await page.wait_for_selector("#cardNumber", timeout=30000)
             except Exception:
                 log("Checkout form did not appear, link may have expired", "error")
+                await browser.close()
                 return {"ok": False, "status": "error", "message": "checkout form did not appear"}
 
             await asyncio.sleep(2)
