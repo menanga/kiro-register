@@ -149,182 +149,182 @@ async def fill_stripe_checkout(payment_url, card_info, cdk_code, log=log, headle
                 headless=headless,
                 args=launch_args,
             )
-            context = await browser.new_context(
-                viewport=fp["viewport"],
-                screen=fp["screen"],
-                locale=fp["locale"],
-                timezone_id=fp["timezone"],
-                user_agent=fp["user_agent"],
-                color_scheme="light",
-                device_scale_factor=fp["pixel_ratio"],
-            )
-            page = await context.new_page()
-            await Stealth().apply_stealth_async(page)
-            await context.add_init_script(_build_fingerprint_script(fp))
-
-            log("Loading Stripe checkout page...")
             try:
-                await page.goto(payment_url, timeout=60000, wait_until="domcontentloaded")
-            except Exception:
-                log("Page load failed, retrying...", "warn")
-                await asyncio.sleep(3)
+                context = await browser.new_context(
+                    viewport=fp["viewport"],
+                    screen=fp["screen"],
+                    locale=fp["locale"],
+                    timezone_id=fp["timezone"],
+                    user_agent=fp["user_agent"],
+                    color_scheme="light",
+                    device_scale_factor=fp["pixel_ratio"],
+                )
+                page = await context.new_page()
+                await Stealth().apply_stealth_async(page)
+                await context.add_init_script(_build_fingerprint_script(fp))
+
+                log("Loading Stripe checkout page...")
                 try:
-                    await page.goto(payment_url, timeout=60000, wait_until="commit")
+                    await page.goto(payment_url, timeout=60000, wait_until="domcontentloaded")
                 except Exception:
-                    log("Checkout page could not be loaded", "error")
-                    await browser.close()
-                    return {"ok": False, "status": "error", "message": "page load failed"}
+                    log("Page load failed, retrying...", "warn")
+                    await asyncio.sleep(3)
+                    try:
+                        await page.goto(payment_url, timeout=60000, wait_until="commit")
+                    except Exception:
+                        log("Checkout page could not be loaded", "error")
+                        return {"ok": False, "status": "error", "message": "page load failed"}
 
-            # Wait for the form to render
-            try:
-                await page.wait_for_selector("#cardNumber", timeout=30000)
-            except Exception:
-                log("Checkout form did not appear, link may have expired", "error")
-                await browser.close()
-                return {"ok": False, "status": "error", "message": "checkout form did not appear"}
-
-            await asyncio.sleep(2)
-
-            # Read the page total — abort if this isn't a $0 trial
-            log("Trial check: reading the 'due today' amount...", "info")
-            amount_value = None
-            try:
-                amount_text = await page.evaluate(r"""() => {
-                    const body = document.body.innerText;
-                    // Look for the amount on the line after "Total due today" / "due today"
-                    const m = body.match(/(?:total due today|due today|amount due)\s*\n\s*\$([\d,.]+)/i);
-                    if (m) return m[1];
-                    // Or the amount on the line after "total"
-                    const m2 = body.match(/\btotal\b\s*\n\s*\$([\d,.]+)/i);
-                    if (m2) return m2[1];
-                    return '';
-                }""")
-                if amount_text:
-                    amount_value = float(amount_text.replace(",", ""))
-                    log(f"Page amount: ${amount_text} (due today)", "info")
-                    if amount_value > 0:
-                        log(f"Not a $0 trial (${amount_text}), aborting payment", "error")
-                        await browser.close()
-                        return {"ok": False, "status": "not_free_trial",
-                                "message": f"due today is ${amount_text}, not a free trial"}
-                    else:
-                        log("Due today is $0.00, confirmed free trial", "info")
-                else:
-                    log("Could not detect a 'Total due today' amount, continuing...", "warn")
-            except Exception as e:
-                log(f"Amount check failed: {e}", "warn")
-
-            # Country selector
-            log("Setting country: United States")
-            try:
-                country_sel = page.locator("#billingCountry")
-                if await country_sel.count() > 0:
-                    await country_sel.select_option("US")
-                    await asyncio.sleep(random.uniform(0.8, 1.5))
-            except Exception:
-                pass
-
-            async def _stripe_move(loc):
+                # Wait for the form to render
                 try:
-                    box = await loc.bounding_box()
-                    if box:
-                        x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
-                        y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
-                        await page.mouse.move(x, y, steps=random.randint(5, 12))
-                        await asyncio.sleep(random.uniform(0.1, 0.3))
+                    await page.wait_for_selector("#cardNumber", timeout=30000)
+                except Exception:
+                    log("Checkout form did not appear, link may have expired", "error")
+                    return {"ok": False, "status": "error", "message": "checkout form did not appear"}
+
+                await asyncio.sleep(2)
+
+                # Read the page total — abort if this isn't a $0 trial
+                log("Trial check: reading the 'due today' amount...", "info")
+                amount_value = None
+                try:
+                    amount_text = await page.evaluate(r"""() => {
+                        const body = document.body.innerText;
+                        // Look for the amount on the line after "Total due today" / "due today"
+                        const m = body.match(/(?:total due today|due today|amount due)\s*\n\s*\$([\d,.]+)/i);
+                        if (m) return m[1];
+                        // Or the amount on the line after "total"
+                        const m2 = body.match(/\btotal\b\s*\n\s*\$([\d,.]+)/i);
+                        if (m2) return m2[1];
+                        return '';
+                    }""")
+                    if amount_text:
+                        amount_value = float(amount_text.replace(",", ""))
+                        log(f"Page amount: ${amount_text} (due today)", "info")
+                        if amount_value > 0:
+                            log(f"Not a $0 trial (${amount_text}), aborting payment", "error")
+                            return {"ok": False, "status": "not_free_trial",
+                                    "message": f"due today is ${amount_text}, not a free trial"}
+                        else:
+                            log("Due today is $0.00, confirmed free trial", "info")
+                    else:
+                        log("Could not detect a 'Total due today' amount, continuing...", "warn")
+                except Exception as e:
+                    log(f"Amount check failed: {e}", "warn")
+
+                # Country selector
+                log("Setting country: United States")
+                try:
+                    country_sel = page.locator("#billingCountry")
+                    if await country_sel.count() > 0:
+                        await country_sel.select_option("US")
+                        await asyncio.sleep(random.uniform(0.8, 1.5))
                 except Exception:
                     pass
 
-            async def _stripe_type(loc, text, delay_range=(40, 110)):
-                await _stripe_move(loc)
-                await loc.click()
-                await asyncio.sleep(random.uniform(0.2, 0.5))
-                await loc.fill("")
-                for i, ch in enumerate(text):
-                    await page.keyboard.type(ch, delay=0)
-                    d = random.uniform(delay_range[0], delay_range[1]) / 1000
-                    if random.random() < 0.06:
-                        d += random.uniform(0.15, 0.4)
-                    await asyncio.sleep(d)
-                await asyncio.sleep(random.uniform(0.4, 0.9))
-
-            # Card number
-            log("Filling card number...")
-            card_input = page.locator("#cardNumber")
-            await _stripe_type(card_input, card_number, (45, 100))
-
-            # Expiry
-            log("Filling expiry...")
-            expiry_input = page.locator("#cardExpiry")
-            await _stripe_type(expiry_input, f"{expiry_month}{expiry_year}", (50, 120))
-
-            # CVV
-            log("Filling CVV...")
-            cvc_input = page.locator("#cardCvc")
-            await _stripe_type(cvc_input, cvv, (60, 140))
-
-            # Cardholder name
-            log("Filling cardholder name...")
-            name_input = page.locator("#billingName")
-            await _stripe_type(name_input, name_on_card, (35, 90))
-
-            # Address
-            log("Filling billing address...")
-            try:
-                addr_input = page.locator("#billingAddressLine1")
-                await _stripe_type(addr_input, address_line1, (30, 80))
-            except Exception:
-                pass
-
-            try:
-                postal_input = page.locator("#billingPostalCode")
-                if await postal_input.count() > 0 and await postal_input.is_visible():
-                    await _stripe_type(postal_input, postal_code, (50, 120))
-            except Exception:
-                pass
-
-            try:
-                city_input = page.locator("#billingLocality")
-                if await city_input.count() > 0 and await city_input.is_visible():
-                    await _stripe_type(city_input, city, (35, 90))
-            except Exception:
-                pass
-
-            try:
-                state_select = page.locator("#billingAdministrativeArea")
-                if await state_select.count() > 0 and await state_select.is_visible():
+                async def _stripe_move(loc):
                     try:
-                        await state_select.select_option(state.strip())
+                        box = await loc.bounding_box()
+                        if box:
+                            x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+                            y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+                            await page.mouse.move(x, y, steps=random.randint(5, 12))
+                            await asyncio.sleep(random.uniform(0.1, 0.3))
                     except Exception:
+                        pass
+
+                async def _stripe_type(loc, text, delay_range=(40, 110)):
+                    await _stripe_move(loc)
+                    await loc.click()
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
+                    await loc.fill("")
+                    for i, ch in enumerate(text):
+                        await page.keyboard.type(ch, delay=0)
+                        d = random.uniform(delay_range[0], delay_range[1]) / 1000
+                        if random.random() < 0.06:
+                            d += random.uniform(0.15, 0.4)
+                        await asyncio.sleep(d)
+                    await asyncio.sleep(random.uniform(0.4, 0.9))
+
+                # Card number
+                log("Filling card number...")
+                card_input = page.locator("#cardNumber")
+                await _stripe_type(card_input, card_number, (45, 100))
+
+                # Expiry
+                log("Filling expiry...")
+                expiry_input = page.locator("#cardExpiry")
+                await _stripe_type(expiry_input, f"{expiry_month}{expiry_year}", (50, 120))
+
+                # CVV
+                log("Filling CVV...")
+                cvc_input = page.locator("#cardCvc")
+                await _stripe_type(cvc_input, cvv, (60, 140))
+
+                # Cardholder name
+                log("Filling cardholder name...")
+                name_input = page.locator("#billingName")
+                await _stripe_type(name_input, name_on_card, (35, 90))
+
+                # Address
+                log("Filling billing address...")
+                try:
+                    addr_input = page.locator("#billingAddressLine1")
+                    await _stripe_type(addr_input, address_line1, (30, 80))
+                except Exception:
+                    pass
+
+                try:
+                    postal_input = page.locator("#billingPostalCode")
+                    if await postal_input.count() > 0 and await postal_input.is_visible():
+                        await _stripe_type(postal_input, postal_code, (50, 120))
+                except Exception:
+                    pass
+
+                try:
+                    city_input = page.locator("#billingLocality")
+                    if await city_input.count() > 0 and await city_input.is_visible():
+                        await _stripe_type(city_input, city, (35, 90))
+                except Exception:
+                    pass
+
+                try:
+                    state_select = page.locator("#billingAdministrativeArea")
+                    if await state_select.count() > 0 and await state_select.is_visible():
                         try:
-                            await state_select.fill(state.strip())
+                            await state_select.select_option(state.strip())
                         except Exception:
-                            pass
-                    await asyncio.sleep(0.2)
-            except Exception:
-                pass
+                            try:
+                                await state_select.fill(state.strip())
+                            except Exception:
+                                pass
+                        await asyncio.sleep(0.2)
+                except Exception:
+                    pass
 
-            log("Form filled, preparing to submit...", "ok")
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+                log("Form filled, preparing to submit...", "ok")
+                await asyncio.sleep(random.uniform(1.5, 3.0))
 
-            # Click Subscribe
-            log("Clicking Subscribe...")
-            submit_btn = page.locator('button[type="submit"]')
-            if await submit_btn.count() > 0:
-                await _stripe_move(submit_btn)
-                await asyncio.sleep(random.uniform(0.3, 0.8))
-                await submit_btn.click()
-            else:
-                log("Submit button not found", "error")
-                return {"ok": False, "status": "error", "message": "submit button not found"}
+                # Click Subscribe
+                log("Clicking Subscribe...")
+                submit_btn = page.locator('button[type="submit"]')
+                if await submit_btn.count() > 0:
+                    await _stripe_move(submit_btn)
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+                    await submit_btn.click()
+                else:
+                    log("Submit button not found", "error")
+                    return {"ok": False, "status": "error", "message": "submit button not found"}
 
-            # Wait for a result
-            log("Waiting for payment result...")
-            result = await _wait_for_payment_result(page, cdk_code, log)
+                # Wait for a result
+                log("Waiting for payment result...")
+                result = await _wait_for_payment_result(page, cdk_code, log)
+                return result
 
-            await browser.close()
-            browser = None
-            return result
+            finally:
+                if browser:
+                    await browser.close()
+                    browser = None
 
     except Exception as e:
         err_msg = str(e)
@@ -335,12 +335,6 @@ async def fill_stripe_checkout(payment_url, card_info, cdk_code, log=log, headle
         else:
             log(f"Payment flow failed: {err_msg[:100]}", "error")
         return {"ok": False, "status": "error", "message": err_msg[:100]}
-    finally:
-        if browser:
-            try:
-                await browser.close()
-            except Exception:
-                pass
 
 
 async def _wait_for_payment_result(page, cdk_code, log, timeout=120):

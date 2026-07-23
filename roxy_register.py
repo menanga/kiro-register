@@ -388,392 +388,347 @@ async def register_with_roxy(
                 log("CDP connection failed!", "err")
                 _cleanup()
                 return _partial_result("CDP connection failed")
-            contexts = browser.contexts
-            context = contexts[0] if contexts else await browser.new_context()
-            await context.clear_cookies()
-            pages = context.pages
-            page = pages[0] if pages else await context.new_page()
-            log("CDP browser connected", "ok")
 
-            async def _js_click_submit():
-                """Locate and click the primary submit/continue button via JS."""
-                await page.evaluate("""() => {
-                    const buttons = Array.from(document.querySelectorAll('button'));
-                    const visible = buttons.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
-                    for (const b of visible) {
-                        const t = (b.innerText || '').toLowerCase();
-                        if (t.includes('continue') || t.includes('next') || t.includes('submit') || t.includes('verify')) {
-                            b.click(); return;
+            try:
+                contexts = browser.contexts
+                context = contexts[0] if contexts else await browser.new_context()
+                await context.clear_cookies()
+                pages = context.pages
+                page = pages[0] if pages else await context.new_page()
+                log("CDP browser connected", "ok")
+
+                async def _js_click_submit():
+                    """Locate and click the primary submit/continue button via JS."""
+                    await page.evaluate("""() => {
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        const visible = buttons.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
+                        for (const b of visible) {
+                            const t = (b.innerText || '').toLowerCase();
+                            if (t.includes('continue') || t.includes('next') || t.includes('submit') || t.includes('verify')) {
+                                b.click(); return;
+                            }
                         }
-                    }
-                    if (visible.length > 0) visible[visible.length - 1].click();
-                }""")
+                        if (visible.length > 0) visible[visible.length - 1].click();
+                    }""")
 
-            # Route interception as a backup; the local callback server is the primary path.
-            async def _route_intercept(route):
-                nonlocal authorization_code, signin_callback_params
-                url = route.request.url
-                parsed = urlparse(url)
-                qs = parse_qs(parsed.query)
-                code = qs.get("code", [""])[0]
-                if code and not authorization_code:
-                    authorization_code = code
-                    log("Captured authorization code (route)", "ok")
-                elif "signin/callback" in parsed.path or qs.get("login_option"):
-                    if not signin_callback_params:
-                        signin_callback_params = {k: v[0] for k, v in qs.items()}
-                await route.continue_()
-
-            await page.route("**/127.0.0.1:3128**", _route_intercept)
-            await page.route("**/localhost:3128**", _route_intercept)
-
-            # CDP Network listener as an additional fallback.
-            cdp_session = await context.new_cdp_session(page)
-            await cdp_session.send("Network.enable")
-
-            def _on_cdp_request(params):
-                nonlocal authorization_code
-                if authorization_code:
-                    return
-                req_url = params.get("request", {}).get("url", "")
-                if ("127.0.0.1:3128" in req_url or "localhost:3128" in req_url) and "code=" in req_url:
-                    qs = parse_qs(urlparse(req_url).query)
+                # Route interception as a backup; the local callback server is the primary path.
+                async def _route_intercept(route):
+                    nonlocal authorization_code, signin_callback_params
+                    url = route.request.url
+                    parsed = urlparse(url)
+                    qs = parse_qs(parsed.query)
                     code = qs.get("code", [""])[0]
-                    if code:
+                    if code and not authorization_code:
                         authorization_code = code
-                        log("Captured authorization code (CDP)", "ok")
-                redir = params.get("redirectResponse", {}).get("headers", {})
-                location = redir.get("Location", "") or redir.get("location", "")
-                if location and "code=" in location and "127.0.0.1:3128" in location:
-                    qs = parse_qs(urlparse(location).query)
-                    code = qs.get("code", [""])[0]
-                    if code:
-                        authorization_code = code
-                        log("Captured authorization code (CDP redirect)", "ok")
+                        log("Captured authorization code (route)", "ok")
+                    elif "signin/callback" in parsed.path or qs.get("login_option"):
+                        if not signin_callback_params:
+                            signin_callback_params = {k: v[0] for k, v in qs.items()}
+                    await route.continue_()
 
-            cdp_session.on("Network.requestWillBeSent", _on_cdp_request)
+                await page.route("**/127.0.0.1:3128**", _route_intercept)
+                await page.route("**/localhost:3128**", _route_intercept)
 
-            # Navigate to the Kiro signin page.
-            await page.goto(signin_url, timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(3)
-            await _dismiss_cookie(page)
+                # CDP Network listener as an additional fallback.
+                cdp_session = await context.new_cdp_session(page)
+                await cdp_session.send("Network.enable")
 
-            # Click the AWS Builder ID button.
-            if "app.kiro.dev" in page.url:
-                log("Selecting sign-in method...")
-                await asyncio.sleep(2)
-                for sel in [
-                    'xpath=//*[@id="layout-viewport"]/div/div/div/div[2]/div/div[1]/button[3]',
-                    'xpath=//button[contains(text(),"AWS Builder ID")]',
-                    'xpath=//button[contains(text(),"Builder ID")]',
-                    'xpath=//button[contains(text(),"Sign in")]',
-                ]:
-                    loc = page.locator(sel)
-                    try:
-                        if await loc.count() > 0 and await loc.first.is_visible():
-                            await loc.first.click()
-                            log("Clicked sign-in button", "ok")
+                def _on_cdp_request(params):
+                    nonlocal authorization_code
+                    if authorization_code:
+                        return
+                    req_url = params.get("request", {}).get("url", "")
+                    if ("127.0.0.1:3128" in req_url or "localhost:3128" in req_url) and "code=" in req_url:
+                        qs = parse_qs(urlparse(req_url).query)
+                        code = qs.get("code", [""])[0]
+                        if code:
+                            authorization_code = code
+                            log("Captured authorization code (CDP)", "ok")
+                    redir = params.get("redirectResponse", {}).get("headers", {})
+                    location = redir.get("Location", "") or redir.get("location", "")
+                    if location and "code=" in location and "127.0.0.1:3128" in location:
+                        qs = parse_qs(urlparse(location).query)
+                        code = qs.get("code", [""])[0]
+                        if code:
+                            authorization_code = code
+                            log("Captured authorization code (CDP redirect)", "ok")
+
+                cdp_session.on("Network.requestWillBeSent", _on_cdp_request)
+
+                # Navigate to the Kiro signin page.
+                await page.goto(signin_url, timeout=60000, wait_until="domcontentloaded")
+                await asyncio.sleep(3)
+                await _dismiss_cookie(page)
+
+                # Click the AWS Builder ID button.
+                if "app.kiro.dev" in page.url:
+                    log("Selecting sign-in method...")
+                    await asyncio.sleep(2)
+                    for sel in [
+                        'xpath=//*[@id="layout-viewport"]/div/div/div/div[2]/div/div[1]/button[3]',
+                        'xpath=//button[contains(text(),"AWS Builder ID")]',
+                        'xpath=//button[contains(text(),"Builder ID")]',
+                        'xpath=//button[contains(text(),"Sign in")]',
+                    ]:
+                        loc = page.locator(sel)
+                        try:
+                            if await loc.count() > 0 and await loc.first.is_visible():
+                                await loc.first.click()
+                                log("Clicked sign-in button", "ok")
+                                break
+                        except Exception:
+                            pass
+                    await asyncio.sleep(3)
+                    for _ in range(20):
+                        if signin_callback_params:
                             break
+                        await asyncio.sleep(1)
+
+                # Build the authorize URL and let the browser navigate to it.
+                if signin_callback_params and not authorization_code:
+                    log("Redirecting to the authorization page...")
+                    authorize_url = f"{REG_OIDC}/authorize?" + urlencode({
+                        "response_type": "code", "client_id": client_id,
+                        "redirect_uri": REG_REDIRECT_URI,
+                        "scopes": ",".join(REG_SCOPES),
+                        "state": state_val, "code_challenge": code_challenge,
+                        "code_challenge_method": "S256",
+                    })
+                    try:
+                        await page.goto(authorize_url, timeout=60000, wait_until="domcontentloaded")
                     except Exception:
                         pass
-                await asyncio.sleep(3)
-                for _ in range(20):
-                    if signin_callback_params:
-                        break
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(3)
 
-            # Build the authorize URL and let the browser navigate to it.
-            if signin_callback_params and not authorization_code:
-                log("Redirecting to the authorization page...")
-                authorize_url = f"{REG_OIDC}/authorize?" + urlencode({
-                    "response_type": "code", "client_id": client_id,
-                    "redirect_uri": REG_REDIRECT_URI,
-                    "scopes": ",".join(REG_SCOPES),
-                    "state": state_val, "code_challenge": code_challenge,
-                    "code_challenge_method": "S256",
-                })
-                try:
-                    await page.goto(authorize_url, timeout=60000, wait_until="domcontentloaded")
-                except Exception:
-                    pass
-                await asyncio.sleep(3)
-
-            # Wait until we land on signin.aws or profile.aws.
-            for _ in range(15):
-                if "signin.aws" in page.url or "profile.aws" in page.url:
-                    break
-                if authorization_code:
-                    break
-                await asyncio.sleep(2)
-            await asyncio.sleep(2)
-
-            # Fill the email on signin.aws when needed.
-            if "signin.aws" in page.url and not authorization_code:
-                # Wait for the email input to render (can be slow in headless mode).
-                email_input = None
-                for _ew in range(10):
-                    loc = page.locator('xpath=//input[@type="email"]')
-                    if await loc.count() > 0 and await loc.first.is_visible():
-                        email_input = loc.first
-                        break
-                    loc = page.locator('xpath=//input[@type="text"]')
-                    if await loc.count() > 0 and await loc.first.is_visible():
-                        email_input = loc.first
-                        break
-                    await asyncio.sleep(1)
-                if email_input:
-                    await email_input.fill(email)
-                    log(f"Email filled: {email}", "ok")
-                    await asyncio.sleep(0.5)
-                    await _js_click_submit()
-                    await asyncio.sleep(4)
-                else:
-                    log("signin.aws: email input not found", "warn")
-
-            # Wait for profile.aws.
-            if not authorization_code:
+                # Wait until we land on signin.aws or profile.aws.
                 for _ in range(15):
-                    if "profile.aws" in page.url:
+                    if "signin.aws" in page.url or "profile.aws" in page.url:
                         break
                     if authorization_code:
                         break
                     await asyncio.sleep(2)
                 await asyncio.sleep(2)
 
-            # --- State machine (mirrors the detection logic in kiro_register.py) ---
-            async def detect_state():
-                nonlocal authorization_code
-                if authorization_code:
-                    return "DONE"
-                url = page.url
-                if "127.0.0.1:3128" in url or "localhost:3128" in url:
-                    qs = parse_qs(urlparse(url).query)
-                    code = qs.get("code", [""])[0]
-                    if code:
-                        authorization_code = code
-                        return "DONE"
-                    return "CALLBACK"
-                if "chrome-error" in url:
-                    return "CALLBACK"
-                try:
-                    result = await page.evaluate("""() => {
-                        const url = location.href;
-                        const pwds = document.querySelectorAll('input[type="password"]');
-                        const visiblePwds = Array.from(pwds).filter(e => e.offsetWidth > 0);
-                        const nameInput = document.querySelector('input[placeholder*="Silva"]');
-                        const otpInput = document.querySelector('input[inputmode="numeric"]') ||
-                                         document.querySelector('input[autocomplete="one-time-code"]') ||
-                                         document.querySelector('input[name*="otp"]') ||
-                                         document.querySelector('input[name*="code"]') ||
-                                         document.querySelector('input[placeholder*="6-digit"]') ||
-                                         document.querySelector('input[placeholder*="digit"]');
-                        const emailInput = document.querySelector('input[type="email"]');
-                        const buttons = Array.from(document.querySelectorAll('button'));
-                        const visibleBtns = buttons.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
-                        const hasConsentBtn = visibleBtns.some(b => {
-                            const t = (b.innerText || '').toLowerCase();
-                            return t.includes('allow') || t.includes('authorize') ||
-                                   t.includes('accept') || t.includes('confirm');
-                        });
-                        const hasAnyInput = document.querySelectorAll('input:not([type="hidden"])').length > 0;
-                        const hasAnyButton = visibleBtns.length > 0;
-                        const isLoading = !hasAnyInput && !hasAnyButton;
-                        return {
-                            url, visiblePwdCount: visiblePwds.length,
-                            hasName: !!(nameInput && nameInput.offsetWidth > 0),
-                            hasOtp: !!(otpInput && otpInput.offsetWidth > 0),
-                            hasEmail: !!(emailInput && emailInput.offsetWidth > 0),
-                            hasConsentBtn, isLoading,
-                        };
-                    }""")
-                except Exception:
-                    return "UNKNOWN"
-                if "chrome-error" in result["url"]:
-                    return "CALLBACK"
-                if result["visiblePwdCount"] >= 1:
-                    return "PASSWORD"
-                if result["hasOtp"]:
-                    return "OTP"
-                if result["hasName"]:
-                    return "NAME"
-                if result["hasEmail"]:
-                    return "EMAIL"
-                if "awsapps.com" in result["url"] and result["hasConsentBtn"]:
-                    return "CONSENT"
-                if "profile.aws" in result["url"]:
-                    return "LOADING"
-                if result["isLoading"]:
-                    return "LOADING"
-                return "UNKNOWN"
-
-            async def wait_for_state(target_states, timeout=60):
-                deadline = time.time() + timeout
-                while time.time() < deadline:
-                    st = await detect_state()
-                    if st in target_states or st == "DONE":
-                        return st
-                    if st == "CALLBACK":
-                        return st
-                    await asyncio.sleep(1.5)
-                return await detect_state()
-
-            # --- Phase 3: registration form ----------------------------
-            log("Phase 3: filling the registration form")
-            await asyncio.sleep(2)
-            await _dismiss_cookie(page)
-
-            state = await wait_for_state(["EMAIL", "NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
-            log(f"Current state: {state}, URL: {page.url[:80]}")
-
-            # EMAIL (fallback for when signin.aws email entry didn't stick).
-            if state == "EMAIL":
-                email_input = page.locator('xpath=//input[@type="email"]')
-                if await email_input.count() == 0:
-                    email_input = page.locator('xpath=//input[@type="text"]')
-                if await email_input.count() > 0:
-                    await email_input.first.fill(email)
-                    log(f"Email filled (state machine fallback): {email}", "ok")
-                    await asyncio.sleep(0.5)
-                    await _js_click_submit()
-                    await asyncio.sleep(4)
-                state = await detect_state()
-
-            # NAME
-            if state == "NAME":
-                name_field = page.locator('xpath=//input[contains(@placeholder,"Silva")]')
-                if await name_field.count() == 0:
-                    name_field = page.locator('xpath=//input[starts-with(@id,"formField")]')
-                if await name_field.count() > 0:
-                    await name_field.first.fill(full_name)
-                    log(f"Name filled: {full_name}", "ok")
-                    await asyncio.sleep(0.5)
-                    await _js_click_submit()
-                    await asyncio.sleep(4)
-                state = await detect_state()
-
-            # OTP
-            if state not in ["DONE", "PASSWORD", "CONSENT", "CALLBACK"]:
-                state = await wait_for_state(["OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
-
-            if state == "OTP":
-                log("Phase 4: OTP verification")
-                await asyncio.sleep(3)
-                otp_code = mail.wait_otp(timeout=90, poll_interval=3)
-                if not otp_code:
-                    log("OTP wait timed out!", "err")
-                    await browser.close()
-                    _cleanup()
-                    return _partial_result("OTP timeout")
-                log(f"OTP received: {otp_code}", "ok")
-                otp_input = None
-                for sel in [
-                    'xpath=//input[@inputmode="numeric"]',
-                    'xpath=//input[@autocomplete="one-time-code"]',
-                    'xpath=//input[contains(@name,"code")]',
-                    'xpath=//input[contains(@placeholder,"digit")]',
-                ]:
-                    loc = page.locator(sel)
-                    if await loc.count() > 0 and await loc.first.is_visible():
-                        otp_input = loc.first
-                        break
-                if not otp_input:
-                    all_inp = page.locator('xpath=//input[not(@type="hidden") and not(@type="password") and not(@type="email")]')
-                    for i in range(await all_inp.count()):
-                        inp = all_inp.nth(i)
-                        if await inp.is_visible():
-                            otp_input = inp
+                # Fill the email on signin.aws when needed.
+                if "signin.aws" in page.url and not authorization_code:
+                    # Wait for the email input to render (can be slow in headless mode).
+                    email_input = None
+                    for _ew in range(10):
+                        loc = page.locator('xpath=//input[@type="email"]')
+                        if await loc.count() > 0 and await loc.first.is_visible():
+                            email_input = loc.first
                             break
-                if otp_input:
-                    await otp_input.fill(otp_code)
-                    await asyncio.sleep(0.5)
-                    await _js_click_submit()
-                    await asyncio.sleep(5)
-                state = await detect_state()
+                        loc = page.locator('xpath=//input[@type="text"]')
+                        if await loc.count() > 0 and await loc.first.is_visible():
+                            email_input = loc.first
+                            break
+                        await asyncio.sleep(1)
+                    if email_input:
+                        await email_input.fill(email)
+                        log(f"Email filled: {email}", "ok")
+                        await asyncio.sleep(0.5)
+                        await _js_click_submit()
+                        await asyncio.sleep(4)
+                    else:
+                        log("signin.aws: email input not found", "warn")
 
-            # PASSWORD
-            if state not in ["DONE", "CONSENT", "CALLBACK"]:
-                state = await wait_for_state(["PASSWORD", "CONSENT", "DONE"], timeout=30)
+                # Wait for profile.aws.
+                if not authorization_code:
+                    for _ in range(15):
+                        if "profile.aws" in page.url:
+                            break
+                        if authorization_code:
+                            break
+                        await asyncio.sleep(2)
+                    await asyncio.sleep(2)
 
-            if state == "PASSWORD":
-                log("Phase 5: setting password")
-                await asyncio.sleep(1)
-                for _wait in range(10):
-                    count = await page.locator('xpath=//input[@type="password"]').count()
-                    if count >= 2:
-                        break
-                    await asyncio.sleep(1)
-                await page.evaluate("""(pwd) => {
-                    const inputs = Array.from(document.querySelectorAll('input[type="password"]'))
-                        .filter(el => el.offsetWidth > 0);
-                    function setVal(el, val) {
-                        const ns = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value').set;
-                        ns.call(el, val);
-                        el.dispatchEvent(new Event('input', {bubbles: true}));
-                        el.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-                    inputs.forEach(el => setVal(el, pwd));
-                }""", password)
-                log("Password filled", "ok")
-                await asyncio.sleep(0.5)
-                await _js_click_submit()
-                await asyncio.sleep(5)
-                state = await detect_state()
-
-            # CONSENT
-            if state not in ["DONE", "CALLBACK"]:
-                state = await wait_for_state(["CONSENT", "DONE", "CALLBACK"], timeout=45)
-
-            if state == "CONSENT" and not authorization_code:
-                log("Phase 6: authorization consent screen")
-                await asyncio.sleep(3)
-                for attempt in range(10):
-                    try:
-                        await page.evaluate("""() => {
-                            const buttons = Array.from(document.querySelectorAll('button'));
-                            const visible = buttons.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
-                            for (const b of visible) {
-                                const t = (b.innerText || '').toLowerCase();
-                                if (t.includes('allow') || t.includes('authorize') || t.includes('accept') || t.includes('confirm')) {
-                                    b.click(); return;
-                                }
-                            }
-                            if (visible.length > 0) visible[visible.length - 1].click();
-                        }""")
-                    except Exception:
-                        break
-                    await asyncio.sleep(3)
+                # --- State machine (mirrors the detection logic in kiro_register.py) ---
+                async def detect_state():
+                    nonlocal authorization_code
                     if authorization_code:
-                        break
-                    new_state = await detect_state()
-                    if new_state != "CONSENT":
-                        break
-
-            # Wait for the OAuth callback code.
-            if not authorization_code:
-                log("Waiting for OAuth callback...")
-                for i in range(30):
-                    if cancel_check and cancel_check():
-                        log("User cancelled", "err")
-                        await browser.close()
-                        _cleanup()
-                        return _partial_result("user cancelled")
-                    if authorization_code:
-                        break
-                    current_url = page.url
-                    if "127.0.0.1:3128" in current_url or "localhost:3128" in current_url:
-                        qs = parse_qs(urlparse(current_url).query)
+                        return "DONE"
+                    url = page.url
+                    if "127.0.0.1:3128" in url or "localhost:3128" in url:
+                        qs = parse_qs(urlparse(url).query)
                         code = qs.get("code", [""])[0]
                         if code:
                             authorization_code = code
+                            return "DONE"
+                        return "CALLBACK"
+                    if "chrome-error" in url:
+                        return "CALLBACK"
+                    try:
+                        result = await page.evaluate("""() => {
+                            const url = location.href;
+                            const pwds = document.querySelectorAll('input[type="password"]');
+                            const visiblePwds = Array.from(pwds).filter(e => e.offsetWidth > 0);
+                            const nameInput = document.querySelector('input[placeholder*="Silva"]');
+                            const otpInput = document.querySelector('input[inputmode="numeric"]') ||
+                                             document.querySelector('input[autocomplete="one-time-code"]') ||
+                                             document.querySelector('input[name*="otp"]') ||
+                                             document.querySelector('input[name*="code"]') ||
+                                             document.querySelector('input[placeholder*="6-digit"]') ||
+                                             document.querySelector('input[placeholder*="digit"]');
+                            const emailInput = document.querySelector('input[type="email"]');
+                            const buttons = Array.from(document.querySelectorAll('button'));
+                            const visibleBtns = buttons.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
+                            const hasConsentBtn = visibleBtns.some(b => {
+                                const t = (b.innerText || '').toLowerCase();
+                                return t.includes('allow') || t.includes('authorize') ||
+                                       t.includes('accept') || t.includes('confirm');
+                            });
+                            const hasAnyInput = document.querySelectorAll('input:not([type="hidden"])').length > 0;
+                            const hasAnyButton = visibleBtns.length > 0;
+                            const isLoading = !hasAnyInput && !hasAnyButton;
+                            return {
+                                url, visiblePwdCount: visiblePwds.length,
+                                hasName: !!(nameInput && nameInput.offsetWidth > 0),
+                                hasOtp: !!(otpInput && otpInput.offsetWidth > 0),
+                                hasEmail: !!(emailInput && emailInput.offsetWidth > 0),
+                                hasConsentBtn, isLoading,
+                            };
+                        }""")
+                    except Exception:
+                        return "UNKNOWN"
+                    if "chrome-error" in result["url"]:
+                        return "CALLBACK"
+                    if result["visiblePwdCount"] >= 1:
+                        return "PASSWORD"
+                    if result["hasOtp"]:
+                        return "OTP"
+                    if result["hasName"]:
+                        return "NAME"
+                    if result["hasEmail"]:
+                        return "EMAIL"
+                    if "awsapps.com" in result["url"] and result["hasConsentBtn"]:
+                        return "CONSENT"
+                    if "profile.aws" in result["url"]:
+                        return "LOADING"
+                    if result["isLoading"]:
+                        return "LOADING"
+                    return "UNKNOWN"
+
+                async def wait_for_state(target_states, timeout=60):
+                    deadline = time.time() + timeout
+                    while time.time() < deadline:
+                        st = await detect_state()
+                        if st in target_states or st == "DONE":
+                            return st
+                        if st == "CALLBACK":
+                            return st
+                        await asyncio.sleep(1.5)
+                    return await detect_state()
+
+                # --- Phase 3: registration form ----------------------------
+                log("Phase 3: filling the registration form")
+                await asyncio.sleep(2)
+                await _dismiss_cookie(page)
+
+                state = await wait_for_state(["EMAIL", "NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
+                log(f"Current state: {state}, URL: {page.url[:80]}")
+
+                # EMAIL (fallback for when signin.aws email entry didn't stick).
+                if state == "EMAIL":
+                    email_input = page.locator('xpath=//input[@type="email"]')
+                    if await email_input.count() == 0:
+                        email_input = page.locator('xpath=//input[@type="text"]')
+                    if await email_input.count() > 0:
+                        await email_input.first.fill(email)
+                        log(f"Email filled (state machine fallback): {email}", "ok")
+                        await asyncio.sleep(0.5)
+                        await _js_click_submit()
+                        await asyncio.sleep(4)
+                    state = await detect_state()
+
+                # NAME
+                if state == "NAME":
+                    name_field = page.locator('xpath=//input[contains(@placeholder,"Silva")]')
+                    if await name_field.count() == 0:
+                        name_field = page.locator('xpath=//input[starts-with(@id,"formField")]')
+                    if await name_field.count() > 0:
+                        await name_field.first.fill(full_name)
+                        log(f"Name filled: {full_name}", "ok")
+                        await asyncio.sleep(0.5)
+                        await _js_click_submit()
+                        await asyncio.sleep(4)
+                    state = await detect_state()
+
+                # OTP
+                if state not in ["DONE", "PASSWORD", "CONSENT", "CALLBACK"]:
+                    state = await wait_for_state(["OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
+
+                if state == "OTP":
+                    log("Phase 4: OTP verification")
+                    await asyncio.sleep(3)
+                    otp_code = mail.wait_otp(timeout=90, poll_interval=3)
+                    if not otp_code:
+                        log("OTP wait timed out!", "err")
+                        _cleanup()
+                        return _partial_result("OTP timeout")
+                    log(f"OTP received: {otp_code}", "ok")
+                    otp_input = None
+                    for sel in [
+                        'xpath=//input[@inputmode="numeric"]',
+                        'xpath=//input[@autocomplete="one-time-code"]',
+                        'xpath=//input[contains(@name,"code")]',
+                        'xpath=//input[contains(@placeholder,"digit")]',
+                    ]:
+                        loc = page.locator(sel)
+                        if await loc.count() > 0 and await loc.first.is_visible():
+                            otp_input = loc.first
                             break
-                    if "code=" in current_url and "code_challenge" not in current_url:
-                        qs = parse_qs(urlparse(current_url).query)
-                        code_val = qs.get("code", [""])[0]
-                        if code_val and len(code_val) > 10:
-                            authorization_code = code_val
+                    if not otp_input:
+                        all_inp = page.locator('xpath=//input[not(@type="hidden") and not(@type="password") and not(@type="email")]')
+                        for i in range(await all_inp.count()):
+                            inp = all_inp.nth(i)
+                            if await inp.is_visible():
+                                otp_input = inp
+                                break
+                    if otp_input:
+                        await otp_input.fill(otp_code)
+                        await asyncio.sleep(0.5)
+                        await _js_click_submit()
+                        await asyncio.sleep(5)
+                    state = await detect_state()
+
+                # PASSWORD
+                if state not in ["DONE", "CONSENT", "CALLBACK"]:
+                    state = await wait_for_state(["PASSWORD", "CONSENT", "DONE"], timeout=30)
+
+                if state == "PASSWORD":
+                    log("Phase 5: setting password")
+                    await asyncio.sleep(1)
+                    for _wait in range(10):
+                        count = await page.locator('xpath=//input[@type="password"]').count()
+                        if count >= 2:
                             break
-                    if "awsapps.com" in current_url:
+                        await asyncio.sleep(1)
+                    await page.evaluate("""(pwd) => {
+                        const inputs = Array.from(document.querySelectorAll('input[type="password"]'))
+                            .filter(el => el.offsetWidth > 0);
+                        function setVal(el, val) {
+                            const ns = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            ns.call(el, val);
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                        inputs.forEach(el => setVal(el, pwd));
+                    }""", password)
+                    log("Password filled", "ok")
+                    await asyncio.sleep(0.5)
+                    await _js_click_submit()
+                    await asyncio.sleep(5)
+                    state = await detect_state()
+
+                # CONSENT
+                if state not in ["DONE", "CALLBACK"]:
+                    state = await wait_for_state(["CONSENT", "DONE", "CALLBACK"], timeout=45)
+
+                if state == "CONSENT" and not authorization_code:
+                    log("Phase 6: authorization consent screen")
+                    await asyncio.sleep(3)
+                    for attempt in range(10):
                         try:
                             await page.evaluate("""() => {
                                 const buttons = Array.from(document.querySelectorAll('button'));
@@ -787,10 +742,57 @@ async def register_with_roxy(
                                 if (visible.length > 0) visible[visible.length - 1].click();
                             }""")
                         except Exception:
-                            pass
+                            break
+                        await asyncio.sleep(3)
+                        if authorization_code:
+                            break
+                        new_state = await detect_state()
+                        if new_state != "CONSENT":
+                            break
+
+                # Wait for the OAuth callback code.
+                if not authorization_code:
+                    log("Waiting for OAuth callback...")
+                    for i in range(30):
+                        if cancel_check and cancel_check():
+                            log("User cancelled", "err")
+                            _cleanup()
+                            return _partial_result("user cancelled")
+                        if authorization_code:
+                            break
+                        current_url = page.url
+                        if "127.0.0.1:3128" in current_url or "localhost:3128" in current_url:
+                            qs = parse_qs(urlparse(current_url).query)
+                            code = qs.get("code", [""])[0]
+                            if code:
+                                authorization_code = code
+                                break
+                        if "code=" in current_url and "code_challenge" not in current_url:
+                            qs = parse_qs(urlparse(current_url).query)
+                            code_val = qs.get("code", [""])[0]
+                            if code_val and len(code_val) > 10:
+                                authorization_code = code_val
+                                break
+                        if "awsapps.com" in current_url:
+                            try:
+                                await page.evaluate("""() => {
+                                    const buttons = Array.from(document.querySelectorAll('button'));
+                                    const visible = buttons.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
+                                    for (const b of visible) {
+                                        const t = (b.innerText || '').toLowerCase();
+                                        if (t.includes('allow') || t.includes('authorize') || t.includes('accept') || t.includes('confirm')) {
+                                            b.click(); return;
+                                        }
+                                    }
+                                    if (visible.length > 0) visible[visible.length - 1].click();
+                                }""")
+                            except Exception:
+                                pass
                     await asyncio.sleep(2)
 
-            await browser.close()
+            finally:
+                if browser:
+                    await browser.close()
     finally:
         _cleanup()
 

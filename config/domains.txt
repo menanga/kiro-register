@@ -1,10 +1,2 @@
-# Put one domain per line below (used by the gsuite_imap mail provider).
-# Each domain must be configured as a catch-all forward to your IMAP inbox.
-# example.com
-# example.net
-# example.org
-
-bng.my.id
-bng.web.id
-bnmx.my.id
-
+forumbaris.com
+dibarisin.com

@@ -917,7 +917,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
 
             if "profile.aws" not in page.url:
                 log(f"Failed to reach profile.aws registration page after navigation (current URL: {page.url})", "err")
-                await browser.close()
                 callback_server.shutdown()
                 return _partial_result("did not reach registration page")
 
@@ -1019,7 +1018,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
 
             state = await wait_for_state(["EMAIL", "NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
             if state == "CANCELLED":
-                await browser.close()
                 callback_server.shutdown()
                 return _partial_result("user cancelled")
 
@@ -1047,7 +1045,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                     await _human_delay(3, 5)
                 state = await wait_for_state(["NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
                 if state == "CANCELLED":
-                    await browser.close()
                     callback_server.shutdown()
                     return _partial_result("user cancelled")
 
@@ -1098,7 +1095,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                 state = await wait_for_state(["OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
 
             if state == "CANCELLED":
-                await browser.close()
                 callback_server.shutdown()
                 return _partial_result("user cancelled")
             if state == "OTP":
@@ -1162,7 +1158,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                     log(f"OTP input not found! Dumping page inputs:", "err")
                     for info in debug_info:
                         log(f"  {info}", "err")
-                    await browser.close()
                     callback_server.shutdown()
                     return _partial_result("OTP input not found")
 
@@ -1172,7 +1167,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                 while time.time() < otp_deadline:
                     if cancel_check and cancel_check():
                         log("User cancelled", "err")
-                        await browser.close()
                         callback_server.shutdown()
                         return _partial_result("user cancelled")
                     otp_code = mail.wait_otp(timeout=5, poll_interval=3)
@@ -1180,7 +1174,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                         break
                 if not otp_code:
                     log("OTP wait timed out!", "err")
-                    await browser.close()
                     callback_server.shutdown()
                     return _partial_result("OTP timeout")
 
@@ -1278,7 +1271,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                         pass
 
                 if otp_dead:
-                    await browser.close()
                     callback_server.shutdown()
                     return _partial_result("OTP rejected (consumed/expired)")
 
@@ -1289,7 +1281,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                     await asyncio.sleep(3)
                 state = await wait_for_state(["PASSWORD", "CONSENT", "DONE", "CALLBACK"], timeout=30)
                 if state == "CANCELLED":
-                    await browser.close()
                     callback_server.shutdown()
                     return _partial_result("user cancelled")
                 log(f"Entering state: {state}", "info")
@@ -1344,7 +1335,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                 state = await wait_for_state(["CONSENT", "DONE", "CALLBACK"], timeout=45)
 
             if state == "CANCELLED":
-                await browser.close()
                 callback_server.shutdown()
                 return _partial_result("user cancelled")
             if state == "CONSENT":
@@ -1386,7 +1376,6 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
             for i in range(30):
                 if cancel_check and cancel_check():
                     log("User cancelled", "err")
-                    await browser.close()
                     callback_server.shutdown()
                     return _partial_result("user cancelled")
                 if authorization_code:
@@ -1420,8 +1409,12 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
                         pass
                 await asyncio.sleep(1)  # Reduced from 2s
 
-            await browser.close()
     finally:
+        # Close browser to prevent zombie Chrome processes
+        try:
+            await browser.close()
+        except Exception:
+            pass
         # `shutdown` stops the serve_forever loop, `server_close` releases the
         # listening socket. Without server_close the socket stays bound until
         # the owning Python process exits -- which broke retry #2..5 in the
@@ -1760,7 +1753,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                 if not email_input:
                     log("Email input field not found after trying all known selectors on registration page", "err")
                     log(f"Page HTML sample for debugging: {(await page.content())[:500]}", "dbg")
-                    await browser.close()
                     return _partial("email input not found")
 
                 # Fill email
@@ -1934,7 +1926,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                                     continue  # Retry Continue button click
                                 else:
                                     log(f"AWS TES blocked registration after {max_send_otp_retries} retry attempts", "err")
-                                    await browser.close()
                                     return _partial("Blocked by AWS TES")
                             else:
                                 # Other 400 error, not TES block
@@ -1951,7 +1942,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
                     if not send_otp_success:
                         log("Failed to navigate past name input page after form submission", "err")
-                        await browser.close()
                         return _partial("Name page navigation failed")
                 else:
                     log("No name input page detected, proceeding to OTP...", "info")
@@ -1985,7 +1975,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
             if not otp_input:
                 log("OTP input field not found on verification page after trying all known selectors", "err")
-                await browser.close()
                 return _partial("OTP input not found")
 
             # Get OTP from email
@@ -1995,7 +1984,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
             otp_deadline = time.time() + 90
             while time.time() < otp_deadline:
                 if cancel_check and cancel_check():
-                    await browser.close()
                     return None
                 try:
                     otp_code = mail_provider_instance.wait_otp(timeout=5, poll_interval=3)
@@ -2035,7 +2023,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
                     otp_deadline = time.time() + 60
                     while time.time() < otp_deadline:
                         if cancel_check and cancel_check():
-                            await browser.close()
                             return None
                         try:
                             otp_code = mail_provider_instance.wait_otp(timeout=5, poll_interval=3)
@@ -2049,7 +2036,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
                 if not otp_code:
                     log("OTP code not received within timeout even after resend attempt", "err")
-                    await browser.close()
                     return _partial("OTP timeout")
 
             log(f"OTP code received from mail provider: {otp_code}", "info")
@@ -2136,7 +2122,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
             if not password_input:
                 log("Password input field not found after multiple retry attempts", "err")
-                await browser.close()
                 return _partial("Password input not found")
 
             # Generate password
@@ -2184,7 +2169,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
             if not confirm_input:
                 log("Confirm password input field not found after multiple retry attempts", "err")
-                await browser.close()
                 return _partial("Confirm password input not found")
 
             # Fill confirm password
@@ -2254,7 +2238,6 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
             if not confirm_button:
                 log("Device code confirmation button not found on authorization page", "err")
-                await browser.close()
                 return _partial("Device code confirmation button not found")
 
             await confirm_button.click()
@@ -2286,19 +2269,21 @@ async def register_via_9router_oauth(headless=True, auto_login=True, skip_onboar
 
             if not allow_button:
                 log("'Allow access' button not found on OAuth consent page", "err")
-                await browser.close()
                 return _partial("Allow access button not found")
 
             await allow_button.click()
             log("Clicked 'Allow access'", "ok")
             await asyncio.sleep(1)
-            await browser.close()
             log("Playwright browser session closed successfully", "dbg")
 
         except Exception as e:
             log(f"Browser automation error during registration flow: {e}", "err")
-            await browser.close()
             return _partial(f"browser: {e}")
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
     # Phase 3: Poll 9router
     log("Phase 3: Polling 9router API for account export completion", "info")

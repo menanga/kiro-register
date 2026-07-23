@@ -35,7 +35,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 
 # Default: run headless, one account every 5 minutes.
-# In Dokploy's Command field override with:
+# In Dokploy, override the "Command" field (NOT "Entrypoint") with:
 #   python service.py --service --delay 300 --no-headless
-# The entrypoint will automatically prepend xvfb-run when --no-headless is present.
+# The entrypoint wrapper will automatically prepend xvfb-run when --no-headless is present.
+# DO NOT override Entrypoint - tini must remain PID 1 to reap zombie Chrome processes.
 CMD ["python", "service.py", "--service", "--delay", "300", "--9router"]
